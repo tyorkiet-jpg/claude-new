@@ -1,37 +1,15 @@
-Windows PowerShell
-Copyright (C) Microsoft Corporation. All rights reserved.
-
-PS C:\Users\Vorte> git init
 git : The term 'git' is not recognized as
- the name of a cmdlet, function, script f
-ile, or operable program. Check the spell
-ing of the name, or if a path was include
-d, verify that the path is correct and tr
+ the name of a cmdlet, function, script file, or operable program. Check the spell 
+ing of the name, or if a path was include 
+d, verify that the path is correct and tr 
 y again.
 At line:1 char:1
 + git init
 + ~~~
-    + CategoryInfo          : ObjectNotF 
-   ound: (git:String) [], CommandNotFou  
+    + CategoryInfo          : ObjectNotF  
+   ound: (git:String) [], CommandNotFou   
   ndException
-    + FullyQualifiedErrorId : CommandNot 
+    + FullyQualifiedErrorId : CommandNot  
    FoundException
- 
-PS C:\Users\Vorte> git add .
-git : The term 'git' is not recognized as
- the name of a cmdlet, function, script f
-ile, or operable program. Check the spell
-ing of the name, or if a path was include
-d, verify that the path is correct and tr
-y again.
-At line:1 char:1
-+ git add .
-+ ~~~
-    + CategoryInfo          : ObjectNotF 
-   ound: (git:String) [], CommandNotFou  
-  ndException
-    + FullyQualifiedErrorId : CommandNot 
-   FoundException
- 
-PS C:\Users\Vorte> ^C
-PS C:\Users\Vorte> 
+
+PS C:\Users\Vorte>
