@@ -1272,9 +1272,9 @@ local function updateView(view: View, dt: number, t: number)
 			foot.Swinging = false
 			foot.Plant = neutral
 		end
-		if pose.Collapse > 0 then
-			position = Vector3.new(position.X, math.max(position.Y, floor.Y + 0.15), position.Z)
-		end
+		-- Never into the floor: a foot goes no lower than it stands (a limp, dying one a little lower).
+		local lowest = floor.Y + body.Stance[leg].Y + (0.15 - body.Stance[leg].Y) * pose.Collapse
+		position = Vector3.new(position.X, math.max(position.Y, lowest), position.Z)
 		foot.Position = position
 	end
 
