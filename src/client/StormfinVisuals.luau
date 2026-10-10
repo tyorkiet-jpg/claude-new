@@ -7,12 +7,14 @@
 -- breach, splashes and a droplet trail when it leaves the water, suspended droplets while it hovers.
 -- Purely visual: the server's invisible hitbox decides all hits.
 local Debris = game:GetService("Debris")
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 
 local Config = require(ReplicatedStorage.Shared.Config.StormfinConfig)
 local Motion = require(ReplicatedStorage.Shared.StormfinMotion)
+local CameraController = require(script.Parent.CameraController)
 local EnemyVisuals = require(script.Parent.EnemyVisuals)
 local VFXUtil = require(script.Parent.VFXUtil)
 
@@ -28,6 +30,9 @@ local UP = Vector3.yAxis
 local WHITE = Color3.new(1, 1, 1)
 local SPINE_SPACING = Config.BodyLength / 6
 local MAX_JOINT_BEND = 0.45 -- radians between neighbouring spine segments: curls like a fish, never folds
+local TURN_BLEND = 0.22 -- seconds to swing from the old facing into a new segment's (no snapping)
+local FLINCH_TIME = 0.22 -- hit reaction length
+local SHAKE_RANGE = 30 -- studs: a breach this close to you shakes the camera
 -- Spine segment sizes, head first: a sleek taper from a broad chest to a thin tail stalk. Each is
 -- about twice the spacing long so neighbours overlap into one smooth body (not a string of beads).
 local SPINE_SIZES = {
@@ -62,6 +67,13 @@ type View = {
 	Segment: Motion.Segment?,
 	Previous: Motion.Segment?,
 	LastY: number?,
+	LastCentre: Vector3?,
+	Forward: Vector3?, -- facing drawn last frame
+	BlendFrom: Vector3?, -- facing when the current segment began
+	BlendStart: number,
+	Speed: number, -- smoothed studs/s along the path
+	Amplitude: number, -- smoothed undulation size
+	Roll: number, -- smoothed roll about the body axis (stun, death)
 	Phase: number,
 	FlinchUntil: number,
 	Dead: boolean,
@@ -228,6 +240,13 @@ local function newView(id: number, serverModel: Model?, model: Model, effects: E
 		Segment = nil,
 		Previous = nil,
 		LastY = nil,
+		LastCentre = nil,
+		Forward = nil,
+		BlendFrom = nil,
+		BlendStart = 0,
+		Speed = 0,
+		Amplitude = 0,
+		Roll = 0,
 		Phase = math.random() * 10,
 		FlinchUntil = 0,
 		Dead = false,
@@ -369,6 +388,15 @@ local function splash(position: Vector3, big: boolean)
 		EmissionDirection = Enum.NormalId.Front,
 		Rotation = NumberRange.new(0, 360),
 	}):Emit(math.round(6 * scale))
+	-- A breach erupting close to you shakes the camera a little.
+	local character = Players.LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if big and root then
+		local closeness = 1 - (root.Position - at).Magnitude / SHAKE_RANGE
+		if closeness > 0 then
+			CameraController.Shake(0.3 * closeness, 0.18)
+		end
+	end
 end
 
 local function setMarkingColor(view: View, color: Color3)
@@ -382,6 +410,8 @@ end
 local function onSegment(view: View, segment: Motion.Segment)
 	view.Previous = view.Segment
 	view.Segment = segment
+	view.BlendFrom = view.Forward
+	view.BlendStart = os.clock()
 	local kind = segment.Kind
 	local extra = segment.Extra or {}
 	if kind == "Windup" then
@@ -391,22 +421,26 @@ local function onSegment(view: View, segment: Motion.Segment)
 		view.Arcs.Rate = 25
 	elseif kind == "Hover" then
 		local startsIn = segment.Start + (extra.ChargeStart or 0) - serverNow()
-		task.delay(math.max(startsIn, 0), function()
-			if view.Segment ~= segment or view.Dead then
-				return
-			end
-			EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, extra.ChargeTime or 0.8, view.Mouth)
-			view.ChargeGlow.Rate = 40
-			view.Arcs.Rate = 45
-			VFXUtil.Flash(view.Mouth, Visuals.BoltColor, 14, 3, extra.ChargeTime or 0.8)
-			task.delay(extra.ChargeTime or 0.8, function()
-				view.ChargeGlow.Rate = 0
-				if view.Segment == segment then
-					view.Arcs.Rate = 4
-					view.FlinchUntil = os.clock() + 0.12 -- head snaps as the bolt leaves
+		-- Joined mid-charge: only the rest of it (the ring still closes on the shot); after: nothing.
+		local chargeTime = (extra.ChargeTime or 0.8) + math.min(startsIn, 0)
+		if chargeTime > 0 then
+			task.delay(math.max(startsIn, 0), function()
+				if view.Segment ~= segment or view.Dead then
+					return
 				end
+				EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, chargeTime, view.Mouth)
+				view.ChargeGlow.Rate = 40
+				view.Arcs.Rate = 45
+				VFXUtil.Flash(view.Mouth, Visuals.BoltColor, 14, 3, chargeTime)
+				-- The shot's lunge is in the motion itself (StormfinMotion, Hover).
+				task.delay(chargeTime, function()
+					view.ChargeGlow.Rate = 0
+					if view.Segment == segment then
+						view.Arcs.Rate = 4
+					end
+				end)
 			end)
-		end)
+		end
 	elseif kind == "Death" then
 		view.Dead = true
 	end
@@ -447,6 +481,24 @@ local function rotationBetween(a: Vector3, b: Vector3): CFrame
 	return CFrame.fromAxisAngle(axis.Unit, math.acos(math.clamp(a:Dot(b), -1, 1)))
 end
 
+local function smooth(x: number): number
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+
+-- Turns unit vector `a` toward `b` by fraction `w` of the angle between them.
+local function turnToward(a: Vector3, b: Vector3, w: number): Vector3
+	local angle = math.acos(math.clamp(a:Dot(b), -1, 1))
+	if angle < 1e-4 then
+		return b
+	end
+	local axis = a:Cross(b)
+	if axis.Magnitude < 1e-5 then -- exactly reversed: swing round horizontally
+		axis = if math.abs(a.Y) < 0.99 then UP else Vector3.xAxis
+	end
+	return CFrame.fromAxisAngle(axis.Unit, angle * w):VectorToWorldSpace(a)
+end
+
 -- Point and head-ward direction on the drawn spine, `offset` studs ahead of the body centre
 -- (extrapolates a little past the head and tail).
 local function sampleSpine(drawn: { Vector3 }, offset: number): (Vector3, Vector3)
@@ -461,14 +513,14 @@ end
 -- centreline but follows the curve's position and direction at its point along the body. The mesh
 -- itself sits on the spine's own middle (not the hitbox facing), so bone transforms only carry the
 -- curvature and the part's bounds stay on the drawn body (correct culling).
-local function poseMesh(view: View, drawn: { Vector3 })
+local function poseMesh(view: View, drawn: { Vector3 }, roll: CFrame)
 	local mesh = view.Mesh :: MeshPart
 	local bones = view.Bones :: { Bone }
 	local restBody = view.RestBody :: { CFrame }
 	local centre = sampleSpine(drawn, 0)
 	local span = drawn[1] - drawn[#drawn]
 	local forward = if span.Magnitude > 1e-3 then span.Unit else -Vector3.zAxis
-	local body = Motion.CFrame(centre, forward)
+	local body = Motion.CFrame(centre, forward) * roll
 	mesh.CFrame = body
 	for i, bone in bones do
 		local rest = restBody[i]
@@ -491,7 +543,13 @@ local function update(dt: number)
 		if not segment then
 			continue
 		end
-		local centre, forward = Motion.Evaluate(segment, t)
+		local centre, forward, progress = Motion.Evaluate(segment, t)
+		-- Each segment starts with its own facing; swing into it from the old one instead of snapping.
+		local blend = (clock - view.BlendStart) / TURN_BLEND
+		if view.BlendFrom and blend < 1 then
+			forward = turnToward(view.BlendFrom, forward, smooth(blend))
+		end
+		view.Forward = forward
 		local kind = segment.Kind
 		local moving = kind == "Swim" or kind == "Leap" or kind == "Dive" or kind == "Stagger"
 		local hovering = kind == "Hover" or kind == "Rise" or kind == "Stun"
@@ -533,24 +591,49 @@ local function update(dt: number)
 			previousDir = if settled.Magnitude > 1e-3 then settled.Unit else previousDir
 		end
 
-		-- Undulation: a travelling side-to-side wave, strongest at the tail.
-		local speedFactor = if kind == "Swim" then 1 elseif hovering then 0.45 else 0.6
+		-- Undulation: a travelling side-to-side wave, strongest at the tail. Swimming, it beats harder
+		-- and faster the faster it actually moves (slow repositions glide, long sprints thrash).
+		if view.LastCentre and dt > 0 then
+			local speed = (centre - view.LastCentre).Magnitude / dt
+			view.Speed += (speed - view.Speed) * math.min(dt * 6, 1)
+		end
+		view.LastCentre = centre
+		local effort = math.clamp(view.Speed / Config.Swim.Speed, 0, 1)
+		local speedFactor = if kind == "Swim" then 0.45 + 0.65 * effort elseif hovering then 0.45 else 0.6
+		view.Amplitude += (0.38 * speedFactor - view.Amplitude) * math.min(dt * 5, 1)
 		view.Phase += dt * (if hovering then 3 else 9) * speedFactor
 		local side = forward:Cross(UP)
 		side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
-		local flinch = if clock < view.FlinchUntil then 1 else 0
+		local charging = view.ChargeGlow.Rate > 0
+		-- Tension: the whole body trembles as a breach winds up and while a bolt charges.
+		local tremble = if view.Dead then 0 elseif kind == "Windup" then smooth(progress / 0.8) elseif charging then 1 else 0
+		-- Hit flinch: a quick jolt up that peaks early and eases back out.
+		local flinch = 0
+		if clock < view.FlinchUntil then
+			flinch = math.sin(math.pi * math.sqrt(1 - (view.FlinchUntil - clock) / FLINCH_TIME))
+		end
 		local drawn = {}
 		for i, point in points do
-			local amount = 0.38 * speedFactor * ((i - 1) / (#points - 1)) ^ 1.3
-			drawn[i] = point + side * math.sin(view.Phase - i * 0.9) * amount + UP * flinch * 0.4 * (1 - i / #points)
+			local along = (i - 1) / (#points - 1)
+			local wave = math.sin(view.Phase - i * 0.9) * view.Amplitude * along ^ 1.3
+			local shiver = math.sin(clock * 55 + i * 1.7) * 0.09 * tremble * (0.4 + 0.6 * along)
+			drawn[i] = point + side * (wave + shiver) + UP * flinch * 0.5 * (1 - i / #points)
 		end
-		local charging = view.ChargeGlow.Rate > 0
+		-- Roll about the body axis: rocks onto its sides while floundering, belly-up when it dies.
+		local targetRoll = 0
+		if kind == "Stun" then
+			targetRoll = 0.55 * math.sin((t - segment.Start) * 5)
+		elseif kind == "Death" then
+			targetRoll = math.pi * smooth((t - segment.Start - Config.DeathFloatTime * 0.5) / 1.1)
+		end
+		view.Roll += (targetRoll - view.Roll) * math.min(dt * 12, 1)
+		local roll = CFrame.Angles(0, 0, view.Roll)
 		if view.Mesh then
-			poseMesh(view, drawn)
+			poseMesh(view, drawn, roll)
 		else
 			for i, segmentPart in view.Spine do
 				local ahead = if i == 1 then drawn[1] + forward else drawn[i - 1]
-				local cframe = Motion.CFrame(drawn[i], (ahead - drawn[i]).Unit)
+				local cframe = Motion.CFrame(drawn[i], (ahead - drawn[i]).Unit) * roll
 				segmentPart.CFrame = cframe
 				view.Markings[i].CFrame = cframe * CFrame.new(0, segmentPart.Size.Y * 0.38, 0)
 			end
@@ -583,7 +666,7 @@ local function update(dt: number)
 		if not view.Dead then
 			local pulse = if charging then 0.5 + 0.5 * math.sin(clock * 18) else 0
 			setMarkingColor(view, Visuals.MarkingColor:Lerp(WHITE, pulse * 0.7 + flinch * 0.6))
-			view.Glow.Brightness = 1.4 + pulse * 2
+			view.Glow.Brightness = 1.4 + pulse * 2 + flinch * 2.5
 		end
 
 		-- Water effects.
@@ -610,7 +693,7 @@ local function onEvent(kind: string, id: number, a: any)
 		onSegment(view, a)
 	elseif kind == "Hit" then
 		if view then
-			view.FlinchUntil = os.clock() + 0.15
+			view.FlinchUntil = os.clock() + FLINCH_TIME
 		end
 	elseif kind == "Death" then
 		if view then

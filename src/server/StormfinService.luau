@@ -168,7 +168,7 @@ local function stagger(fin: Fin, away: Vector3)
 		local breach = Config.Breach
 		local position = evaluate(fin)
 		local landing = flat(position) + away * 7 + UP * (Config.SurfaceY + 0.6)
-		local knock: Segment = { Kind = "Stagger", Start = now(), Duration = breach.StaggerTime, A = position, B = landing, Height = 3 }
+		local knock: Segment = { Kind = "Stagger", Start = now(), Duration = breach.StaggerTime, A = position, B = landing, Height = 3, Look = -away }
 		setSegment(fin, knock, true)
 		if waitSegment(fin, knock) then
 			local stun: Segment = { Kind = "Stun", Start = now(), Duration = breach.StunTime, A = landing, B = landing, Look = -away }
@@ -284,8 +284,9 @@ local function breach(fin: Fin, targetRoot: BasePart)
 			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 			local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
 			if character and humanoid and root and humanoid.Health > 0 and not alreadyHit[player] then
-				-- Body capsule: anywhere from the head back along the body counts.
-				local tail = position - forward * (Config.BodyLength * 0.3)
+				-- Capsule from the head back to HitBack along the body: the front of the fish hits,
+				-- a brush from the tail doesn't.
+				local tail = position - forward * (Config.BodyLength * settings.HitBack)
 				local segment = head - tail
 				local t = math.clamp((root.Position - tail):Dot(segment) / segment:Dot(segment), 0, 1)
 				if (root.Position - (tail + segment * t)).Magnitude <= settings.HitRadius then
@@ -396,7 +397,9 @@ local function bolt(fin: Fin, targetRoot: BasePart)
 		return
 	end
 	if targetRoot.Parent then
-		fireBolt(fin, hoverPoint + look * (Config.BodyLength * 0.45), targetRoot.Position)
+		-- From the mouth where it is right now (the hover drifts), so the bolt leaves the fish's mouth.
+		local position, forward = evaluate(fin)
+		fireBolt(fin, position + forward * (Config.BodyLength * 0.45), targetRoot.Position)
 	end
 	if not waitSegment(fin, hover) then
 		return

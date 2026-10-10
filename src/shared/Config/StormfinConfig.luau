@@ -46,6 +46,7 @@ local StormfinConfig = {
 		AimHeight = 3, -- passes through the player at about chest height
 		Damage = 25,
 		HitRadius = 3.2,
+		HitBack = 0.05, -- hit capsule runs from the head to this fraction of BodyLength behind the centre (0.3 = the old whole-body hit)
 		Parryable = true,
 		StaggerTime = 0.55, -- a parried breach knocks it back...
 		StunTime = 1.3, -- ...then it flounders on the surface, open to fire

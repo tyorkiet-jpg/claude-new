@@ -11,7 +11,7 @@ export type Segment = {
 	B: Vector3, -- end point
 	C: Vector3?, -- Bezier control point (Swim)
 	Height: number?, -- arc height (Leap, Stagger, Dive)
-	Look: Vector3?, -- facing (Windup, Rise, Hover, Stun, Death)
+	Look: Vector3?, -- facing (Windup, Rise, Hover, Stagger, Stun, Death)
 	Extra: { [string]: any }?, -- kind-specific timing (Hover: ChargeStart/ChargeTime/FireAt)
 }
 
@@ -33,6 +33,35 @@ end
 
 local function flat(v: Vector3): Vector3
 	return Vector3.new(v.X, 0, v.Z)
+end
+
+-- Overshoots the target a little and settles back (ends exactly on 1).
+local function backOut(x: number): number
+	x = math.clamp(x, 0, 1) - 1
+	local c = 1.2
+	return 1 + (c + 1) * x ^ 3 + c * x ^ 2
+end
+
+-- Facing along `base` (flat) pitched nose-up by `pitch` radians.
+local function pitched(base: Vector3, pitch: number): Vector3
+	return (base * math.cos(pitch) + UP * math.sin(pitch)).Unit
+end
+
+-- Storm Bolt charge: 0 = neutral, 1 = fully coiled back (nose up), negative = lunging forward.
+-- Coils over most of the charge, snaps forward into the shot so it is neutral exactly at fire
+-- time (the mouth is where the bolt starts), then follows through and settles.
+local function chargeCoil(progress: number, sinceFire: number): number
+	if progress <= 0 then
+		return 0
+	elseif sinceFire < 0 then
+		if progress < 0.85 then
+			return smooth(progress / 0.85)
+		end
+		local s = (progress - 0.85) / 0.15
+		return 1 - s * s
+	end
+	local k = sinceFire / 0.08
+	return -0.6 * k * math.exp(1 - k)
 end
 
 -- Ballistic-looking arc: straight line A->B lifted by a parabola of the given height.
@@ -59,22 +88,42 @@ function StormfinMotion.Evaluate(seg: Segment, now: number): (Vector3, Vector3, 
 		-- Slides under the launch point, then curls nose-up ready to explode out of the water.
 		local position = seg.A:Lerp(seg.B, easeOut(u / 0.5))
 		local pitch = 0.9 * smooth((u - 0.4) / 0.6)
-		local forward = unitOr(flat(look), -Vector3.zAxis) * math.cos(pitch) + UP * math.sin(pitch)
-		return position - UP * 0.4 * math.sin(math.pi * u), forward.Unit, u
+		-- Anticipation: sinks as it coils, then pushes up in the last instant into the launch.
+		local crouch = if u < 0.88 then smooth(u / 0.88) else 1 - ((u - 0.88) / 0.12) ^ 2
+		return position - UP * 0.6 * crouch, pitched(unitOr(flat(look), -Vector3.zAxis), pitch), u
+	elseif kind == "Stagger" and seg.Look then
+		-- Knocked back still facing the player who parried it: the head is thrown back, then it
+		-- rights itself as it lands.
+		local position = arc(seg, u)
+		return position, pitched(unitOr(flat(seg.Look), -Vector3.zAxis), 1.0 * math.sin(math.pi * u)), u
 	elseif kind == "Leap" or kind == "Stagger" or kind == "Dive" then
 		local position, forward = arc(seg, u)
 		return position, forward, u
 	elseif kind == "Rise" then
-		local e = smooth(u)
+		-- Bursts up out of the water, overshoots the hover height a little and settles; noses up,
+		-- then levels off (dipping slightly as it settles).
+		local e = backOut(u)
 		local position = seg.A:Lerp(seg.B, e)
-		-- Noses up out of the water, levelling off into the hover.
-		local pitch = 1.1 * (1 - e)
-		local forward = unitOr(flat(look), -Vector3.zAxis) * math.cos(pitch) + UP * math.sin(pitch)
-		return position, forward.Unit, u
-	elseif kind == "Hover" or kind == "Stun" then
+		return position, pitched(unitOr(flat(look), -Vector3.zAxis), 1.1 * (1 - e)), u
+	elseif kind == "Stun" then
+		-- Floundering on the surface: thrashes side to side and slaps up and down on the water.
 		local t = now - seg.Start
-		local bob = if kind == "Hover" then 0.35 * math.sin(t * 2 * math.pi / 1.6) else 0.15 * math.sin(t * 9)
-		return seg.A + UP * bob, unitOr(look, -Vector3.zAxis), u
+		local thrash = 0.45 * math.sin(t * 7) * (0.6 + 0.4 * math.cos(t * 2.3))
+		local forward = CFrame.fromAxisAngle(UP, thrash):VectorToWorldSpace(unitOr(flat(look), -Vector3.zAxis))
+		return seg.A + UP * 0.3 * math.abs(math.sin(t * 5)), forward, u
+	elseif kind == "Hover" then
+		-- Slow figure-eight drift instead of a plain bob, plus the charge coil and shot lunge.
+		local t = now - seg.Start
+		local base = unitOr(flat(look), -Vector3.zAxis)
+		local side = base:Cross(UP)
+		local position = seg.A + UP * 0.35 * math.sin(t * 2 * math.pi / 1.6) + side * 0.25 * math.sin(t * math.pi / 1.6)
+		local coil = 0
+		local extra = seg.Extra
+		if extra and extra.ChargeStart and extra.ChargeTime then
+			local charge = t - extra.ChargeStart
+			coil = chargeCoil(charge / extra.ChargeTime, charge - extra.ChargeTime)
+		end
+		return position - base * 0.9 * coil, pitched(base, 0.3 * coil), u
 	elseif kind == "Death" then
 		local extra = seg.Extra or {}
 		local float = extra.FloatTime or 0.7
