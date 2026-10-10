@@ -82,7 +82,7 @@ local JAW_MIN = 0.08
 local GAITS = {
 	{ Name = "Walk", Until = 8, Offsets = { BL = 0, BR = 0.5, FL = 0.25, FR = 0.75 }, LiftF = 0.26, LiftH = 0.22, Bob = 0.04, BobRate = 2, BobAt = 0.15, DropF = 0.2, DropH = 0.12 },
 	{ Name = "Trot", Until = 13.75, Offsets = { BL = 0, FR = 0, BR = 0.5, FL = 0.5 }, LiftF = 0.45, LiftH = 0.4, Bob = 0.06, BobRate = 2, BobAt = 0.47, DropF = 0.28, DropH = 0.17 },
-	{ Name = "Gallop", Until = math.huge, Offsets = { BL = 0, BR = 0.1, FR = 0.45, FL = 0.55 }, LiftF = 0.85, LiftH = 0.7, Bob = 0.11, BobRate = 1, BobAt = 0.9, DropF = 0.42, DropH = 0.24 },
+	{ Name = "Gallop", Until = math.huge, Offsets = { BL = 0, BR = 0.1, FR = 0.45, FL = 0.55 }, LiftF = 0.6, LiftH = 0.7, Bob = 0.11, BobRate = 1, BobAt = 0.9, DropF = 0.42, DropH = 0.24 },
 }
 local GAIT_BLEND = 1.6 -- studs/s over which one gait blends into the next (centred on its Until)
 -- Strides per second and the fraction of the stride each foot is on the ground, by speed (studs/s).
@@ -207,6 +207,7 @@ type View = {
 	Feet: { [string]: Foot },
 	Overrides: { [string]: number }, -- per foot: how much an attack pose owns it (smoothed)
 	Flying: boolean,
+	Air: number, -- 0 on the ground .. 1 in a lunge's flight (eased)
 	Trail: Vector3, -- the hitbox position, low-passed (lags it by exactly velocity / TRACK_RATE)
 	TargetVelocity: Vector3, -- the hitbox velocity estimate (spring smoothed)
 	TargetAccel: Vector3,
@@ -1028,11 +1029,13 @@ local function updateView(view: View, dt: number, t: number)
 		view.Velocity = (to - from) / duration + UP * (4 * height * (1 - 2 * u) / duration)
 		local along = flat(to - from)
 		if along.Magnitude > 0.05 then
-			view.Yaw = view.Yaw + wrapAngle(yawOf(along) - view.Yaw)
+			-- (Swung round onto the leap quickly, not snapped: it may launch a little off its heading.)
+			view.Yaw, view.YawRate = spring(view.Yaw, view.YawRate, view.Yaw + wrapAngle(yawOf(along) - view.Yaw), 2 * TURN_RATE, dt)
 		end
-		view.YawRate = 0
 		-- Pitches with the arc (a little less than the arc itself: the body stays level-ish).
-		pose.Pitch += 0.7 * math.atan2(view.Velocity.Y, math.max(flat(view.Velocity).Magnitude, 1))
+		-- (Eased in at take-off and out at landing, so the body doesn't snap.)
+		local window = smooth(u / 0.2) * smooth((1 - u) / 0.2)
+		pose.Pitch += 0.7 * window * math.atan2(view.Velocity.Y, math.max(flat(view.Velocity).Magnitude, 1))
 	else
 		local age = clock - view.LastTargetAt
 		local overdue = math.max(0.045, TRACK.StopAfter * view.StepGap)
@@ -1072,7 +1075,9 @@ local function updateView(view: View, dt: number, t: number)
 	else
 		view.Moving = speed > MOVE_ON
 	end
-	local stepping = clamp01(speed / 5) * (if flying then 0 else 1)
+	-- (Leaving and touching the ground blends the gait's crouch, rhythm and lean out and back in.)
+	view.Air += ((if flying then 1 else 0) - view.Air) * (1 - math.exp(-12 * dt))
+	local stepping = clamp01(speed / 5) * (1 - view.Air)
 	local dropF = STAND_DROP + (blendGait(weights, "DropF") - STAND_DROP) * stepping
 	local dropH = STAND_DROP + (blendGait(weights, "DropH") - STAND_DROP) * stepping
 	-- (Lowering the shoulders more than the hips pitches the body, about its centre.)
@@ -1115,7 +1120,7 @@ local function updateView(view: View, dt: number, t: number)
 
 	-- Dynamics: banks into turns, leans into acceleration, the spine bends into the turn with the
 	-- pelvis following a beat later.
-	local grounded = if flying then 0 else 1
+	local grounded = 1 - view.Air
 	local forward = view.Accel:Dot(heading)
 	local bankTarget = -math.clamp(BANK.Gain * math.atan(speed * view.YawRate / G), -BANK.Max, BANK.Max) * smooth((speed - 4) / 8) * grounded * alive
 	view.Bank, view.BankRate = spring(view.Bank, view.BankRate, bankTarget, BANK.Rate, dt)
@@ -1419,6 +1424,7 @@ local function track(server: Model)
 		Feet = feet,
 		Overrides = { FL = 0, FR = 0, BL = 0, BR = 0 },
 		Flying = false,
+		Air = 0,
 		Trail = root.Position,
 		TargetVelocity = Vector3.zero,
 		TargetAccel = Vector3.zero,
