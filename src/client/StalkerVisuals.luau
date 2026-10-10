@@ -775,11 +775,11 @@ local function actionPose(view: View, t: number): (Pose, string, number)
 		local raised = swipe.Wind * (1 - swipe.Back)
 		local through = swipe.Sweep * (1 - swipe.Back)
 		pose.Pitch = 0.22 * raised - 0.1 * through
-		pose.Roll = -side * 0.14 * raised
+		pose.Roll = -side * 0.14 * raised + side * 0.08 * through -- the shoulder dips into the swipe
 		pose.Crouch = -0.12 * raised + 0.15 * through
 		pose.Shift = 0.35 * through
 		-- Winds the swinging shoulder back, then whips through past the middle.
-		pose.Twist = -side * 0.28 * swipe.Wind * (1 - swipe.Back) + side * 0.5 * through
+		pose.Twist = -side * 0.28 * swipe.Wind * (1 - swipe.Back) + side * 0.72 * through
 		pose.HeadTurn = side * 0.18 * raised
 		pose.HeadPitch, pose.Jaw = 0.1, 0.5
 		pose.Tremble = if since < 0 then 0.5 * swipe.Wind else 0
@@ -813,7 +813,9 @@ local function actionPose(view: View, t: number): (Pose, string, number)
 		pose.HeadPitch = 0.85 * snap - 0.12 * reel * math.sin(elapsed * 18)
 		pose.NeckPush, pose.Jaw = -0.9 * snap, 0.55 * reel
 		pose.Pitch, pose.Shift, pose.Crouch = 0.22 * reel, -0.4 * reel, 0.25 * reel
-		pose.HeadTurn = 0.15 * math.sin(elapsed * 22) * math.exp(-elapsed * 6)
+		-- ...and is knocked aside (alternating sides), shaking as it comes back.
+		local aside = if view.Seq % 2 == 0 then 1 else -1
+		pose.HeadTurn = aside * 0.3 * snap + 0.15 * math.sin(elapsed * 22) * math.exp(-elapsed * 6)
 	elseif action == "Stagger" then
 		-- All three frenzy strikes parried: the front legs buckle, the head reels and shakes.
 		local hold = math.min(elapsed / 0.1, 1) * (1 - smooth((elapsed - frenzy.StaggerTime * 0.65) / (frenzy.StaggerTime * 0.35)))
