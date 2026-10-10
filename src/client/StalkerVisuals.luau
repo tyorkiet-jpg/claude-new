@@ -71,44 +71,58 @@ local JAW_REST = 0.65
 local JAW_RANGE = 0.6
 local JAW_MIN = 0.08
 
--- Gaits. Phase offsets are the fraction of the stride cycle at which each foot lifts off; Duty is
--- the fraction of the cycle a foot spends on the ground; Lift the swing height (studs); Bob the
--- body's vertical bounce (studs) and BobRate how many bounces per stride. A walk (lateral
--- sequence) blends into a trot (diagonal pairs) and a rotary gallop (hind pair, then fore pair in
--- the opposite order, like a big cat) as it speeds up.
+-- Gaits (numbers from felid/canid locomotion studies, scaled to this body: see the research notes
+-- in the handoff). Offsets: when each foot touches down, as a fraction of the stride cycle (hind
+-- left = 0). A lateral-sequence walk blends into a trot (diagonal pairs) and a rotary gallop (hind
+-- pair, then fore pair in the opposite order, like a big cat). Lift: swing height (studs, front /
+-- hind). Bob: the body's vertical bounce (studs, half peak-to-peak), BobRate bounces per stride,
+-- BobAt the phase of the highest point. DropF / DropH: how much lower the shoulders / hips ride (a
+-- prowl; a crouched, head-low gallop), which also gives the legs the bend they need to reach (the
+-- front legs need more of it: they are shorter).
 local GAITS = {
-	{ Name = "Walk", Until = 9, Offsets = { BL = 0, FL = 0.25, BR = 0.5, FR = 0.75 }, Duty = 0.64, Lift = 0.32, Bob = 0.05, BobRate = 2, Flex = 0 },
-	{ Name = "Trot", Until = 18, Offsets = { FL = 0, BR = 0, FR = 0.5, BL = 0.5 }, Duty = 0.5, Lift = 0.45, Bob = 0.08, BobRate = 2, Flex = 0.04 },
-	{ Name = "Gallop", Until = math.huge, Offsets = { BL = 0, BR = 0.1, FR = 0.42, FL = 0.52 }, Duty = 0.36, Lift = 0.6, Bob = 0.16, BobRate = 1, Flex = 0.2 },
+	{ Name = "Walk", Until = 8, Offsets = { BL = 0, BR = 0.5, FL = 0.25, FR = 0.75 }, LiftF = 0.26, LiftH = 0.22, Bob = 0.04, BobRate = 2, BobAt = 0.15, DropF = 0.2, DropH = 0.12 },
+	{ Name = "Trot", Until = 13.75, Offsets = { BL = 0, FR = 0, BR = 0.5, FL = 0.5 }, LiftF = 0.45, LiftH = 0.4, Bob = 0.06, BobRate = 2, BobAt = 0.47, DropF = 0.28, DropH = 0.17 },
+	{ Name = "Gallop", Until = math.huge, Offsets = { BL = 0, BR = 0.1, FR = 0.45, FL = 0.55 }, LiftF = 0.85, LiftH = 0.7, Bob = 0.11, BobRate = 1, BobAt = 0.9, DropF = 0.42, DropH = 0.24 },
 }
-local GAIT_BLEND = 3 -- studs/s over which one gait blends into the next (centred on its Until)
-local STRIDE_RATE = { Base = 0.95, PerStud = 0.056 } -- strides per second = Base + PerStud * speed
+local GAIT_BLEND = 1.6 -- studs/s over which one gait blends into the next (centred on its Until)
+-- Strides per second and the fraction of the stride each foot is on the ground, by speed (studs/s).
+local STRIDE_RATE = { { 0, 0.9 }, { 5, 1.25 }, { 7, 1.45 }, { 10, 1.7 }, { 14, 1.95 }, { 20, 2.3 }, { 30, 2.6 } }
+local DUTY = { { 0, 0.72 }, { 5, 0.65 }, { 7, 0.6 }, { 10, 0.46 }, { 14, 0.4 }, { 17, 0.37 }, { 20, 0.33 }, { 30, 0.28 } }
+local STAND_DROP = 0.15 -- studs lower than the model's straight-legged rest pose, standing still
+local LEG_SLACK = 0.94 -- legs stand at most this fraction of their full length (never locked straight)
+local GIRDLE = { Front = 0.3, Hind = 0.18, Rise = 0.1 } -- shoulder blade / pelvis travel with each stride (studs)
 local MOVE_ON, MOVE_OFF = 1.6, 0.9 -- studs/s: it starts / stops stepping in gait above / below these
-local IDLE_STEP_ERROR = 0.45 -- studs: standing, a foot this far from where it should be steps
+local IDLE_STEP_ERROR = 0.4 -- studs: standing, a foot this far from where it should be steps
 local IDLE_STEP_TIME = 0.26
 local MAX_PLANT_ERROR = 6 -- studs: a planted foot this far off (a teleport) snaps instead of stepping
-local LAND_AHEAD = 0.5 -- of the stance time: a swinging foot lands this far ahead of its neutral spot
-local MAX_LAND_AHEAD = 2.0 -- studs
+local RETARGET_UNTIL = 0.7 -- of a swing: the landing spot follows the body until then, then holds
+local SWING_LIFT = 1 / (0.385 ^ 2 * 0.615 ^ 3.2) -- scales s²(1 - s)^3.2 (peak at 38.5%) to 1
 
-local FOLLOW_RATE = 14 -- 1/s: critically damped spring onto the server hitbox position
+local FOLLOW_RATE = 16 -- 1/s: critically damped spring onto the server hitbox position...
+-- ...fed part of its velocity, estimated from the replicated steps (Rate: low-pass of the position,
+-- Smooth: spring on the estimate), so it lags less at speed; Feed is kept partial, and dropped once
+-- a step is overdue (StopAfter x the usual gap between steps), so a sudden stop barely overshoots.
+local TRACK = { Rate = 20, Smooth = 30, Feed = 0.5, StopAfter = 1.6, Carry = 1.2 }
+local ACCEL_RATE = 8 -- 1/s: the acceleration the body leans with is smoothed this much
+local SOFT_IK = 0.05 -- of a limb's length: it eases into full stretch over the last 5% (no knee snap)
 local TURN_RATE = 12 -- 1/s: ...and onto its heading
-local BANK = 0.55 -- of the lean a turning body would need: rolls into turns
-local BANK_G = 190 -- studs/s² that the bank is measured against
-local MAX_BANK = 0.32 -- radians
-local LEAN = 0.0016 -- radians of pitch per stud/s² of forward acceleration (nose down speeding up)
-local MAX_LEAN = 0.14
-local SPINE_BEND = 0.06 -- radians of spine bend per rad/s of turn rate
-local MAX_SPINE_BEND = 0.32
+local G = 35 -- studs/s²: real gravity at this scale (1 stud ~ 0.28 m), for leaning and banking
+local BANK = { Gain = 0.55, Max = 0.35, Rate = 11 } -- rolls into turns (fraction of the lean physics asks for)
+local LEAN = { Forward = 0.105, Brake = 0.2, Max = 0.2, Drop = 0.135 } -- radians / studs per g of acceleration
+local SPINE_BEND = { Reach = 3, Max = 0.5, Rate = 8 } -- curve into turns: curvature x Reach studs, the pelvis lagging
 local POSE_BLEND = 12 -- 1/s: a change of action eases out its jump this fast
+local POSITION_BLEND = 14 -- 1/s: and so does a jump of the body (a lunge starting a frame late)
 local BODY_SPRING = 26 -- 1/s: body channels (crouch, pitch, roll) follow their targets on a spring
-local LOOK = { Omega = 9, Damping = 0.6, MaxYaw = 0.75, MaxPitch = 0.35 }
+local LOOK = { Omega = 9, Damping = 0.6, MaxYaw = 0.75, MaxPitch = 0.35, Lead = 0.2 }
+local SCAN = { Hold = { 1.5, 4 }, Yaw = 0.7, Pitch = 0.15 } -- idle head scanning: new gaze every 1.5-4 s
+local SHIFT = { Every = { 3, 8 }, Side = 0.08, Fore = 0.05 } -- idle weight shifts
 
 -- Foot targets in the body frame (studs from the body centre): mid-lunge (front: the wrist, hind:
 -- the ball of the foot; from take-off to just before landing) and a frenzy swipe's raised,
 -- reaching and raking points (the wrist; x is mirrored per side).
 local FLIGHT_FRONT = { Vector3.new(0.85, -0.5, -3.0), Vector3.new(0.9, -1.7, -2.5) }
 local FLIGHT_BACK = { Vector3.new(0.8, -1.4, 4.0), Vector3.new(0.8, -2.0, 2.3) }
-local SWIPE_RAISED = Vector3.new(1.55, 1.0, -1.7)
+local SWIPE_RAISED = Vector3.new(1.6, 0.45, -1.8)
 local SWIPE_REACH = Vector3.new(0.7, 0.3, -3.5)
 local SWIPE_RAKED = Vector3.new(-0.5, -1.55, -3.1)
 
@@ -149,8 +163,12 @@ type Body = {
 	Relative: { [string]: CFrame }, -- each bone relative to its parent bone (rest)
 	Length: { [string]: number }, -- bone to its child (or tip)
 	Direction: { [string]: Vector3 }, -- the same, model space unit vector
-	Stance: { [string]: Vector3 }, -- rest foot targets in the ground frame (wrist / ball of the foot)
+	Stance: { [string]: Vector3 }, -- standing foot targets in the ground frame (wrist / ball of the foot)
+	Stride: { [string]: Vector3 }, -- the same, moved fore / aft under its shoulder / hip: the middle of a stride
 	Meta: { [string]: Vector3 }, -- hind legs: hock to ball, model space
+	Joint: { [string]: Vector3 }, -- shoulder / hip, model space (rest)
+	GirdleZ: { Front: number, Hind: number }, -- where the shoulders / hips are along the body (model z)
+	Reach: { [string]: number }, -- shoulder to wrist / hip to hock at full stretch
 	TailLengths: { number },
 	Points: { [string]: Attachment }, -- Head, BiteOrigin, LeftClaw, RightClaw
 	PointOffsets: { [string]: CFrame }, -- each point relative to its bone
@@ -163,11 +181,16 @@ type Foot = {
 	Plant: Vector3, -- where it stands (world), while not swinging
 	Swinging: boolean,
 	From: Vector3, -- where the swing started (world)
+	FromLocal: Vector3, -- the same in the body's ground frame at lift-off...
+	FromRate: Vector3, -- ...and how it was moving in that frame (studs/s; it was still on the ground)
 	SwingStart: number, -- os.clock()
 	SwingTime: number,
 	Cycle: number, -- gait cycle it last stepped in
+	Landing: Vector3, -- where the swing will land (world); follows the body early in the swing
 	Position: Vector3, -- this frame's foot target (world)
 	Lifted: number, -- 0 flat on the floor .. 1 fully off it
+	Girdle: Vector3, -- shoulder blade / pelvis offset this frame (body frame)
+	Held: Vector3, -- where an attack pose last put it (world), eased back from when it lets go
 }
 
 type View = {
@@ -175,7 +198,8 @@ type View = {
 	Body: Body,
 	Position: Vector3, -- body centre (spring)
 	Velocity: Vector3,
-	Accel: Vector3, -- smoothed
+	Accel: Vector3, -- smoothed (what the body leans and banks with)
+	AccelRate: Vector3,
 	Yaw: number, -- heading angle (spring); heading = CFrame.Angles(0, Yaw, 0).LookVector
 	YawRate: number,
 	Cycle: number, -- gait cycles (unwrapped)
@@ -183,6 +207,24 @@ type View = {
 	GaitWeights: { number }, -- walk, trot, gallop
 	Feet: { [string]: Foot },
 	Overrides: { [string]: number }, -- per foot: how much an attack pose owns it (smoothed)
+	Flying: boolean,
+	Trail: Vector3, -- the hitbox position, low-passed (lags it by exactly velocity / TRACK_RATE)
+	TargetVelocity: Vector3, -- the hitbox velocity estimate (spring smoothed)
+	TargetAccel: Vector3,
+	LastTarget: Vector3, -- the last replicated hitbox position, and when it arrived
+	LastTargetAt: number,
+	StepGap: number, -- usual time between replicated steps (s)
+	Offset: Vector3, -- a jump of the body being eased out (world)
+	OffsetStart: number,
+	Bank: number,
+	BankRate: number,
+	HipsBend: number, -- the pelvis follows the chest into a turn a little late
+	HipsBendRate: number,
+	Gaze: Vector2, -- idle scanning: yaw, pitch
+	GazeUntil: number,
+	Weight: Vector2, -- idle weight shift: side, fore
+	WeightGoal: Vector2,
+	WeightUntil: number,
 	Tail: { Vector3 },
 	TailVelocity: { Vector3 },
 	LookYaw: number,
@@ -340,6 +382,7 @@ local function buildBody(id: number): Body?
 		Length = {},
 		Direction = {},
 		Stance = {},
+		Stride = {},
 		Meta = {},
 		TailLengths = {},
 		Points = {},
@@ -384,9 +427,36 @@ local function buildBody(id: number): Body?
 	end
 	body.Stance.FL, body.Stance.FR = stance("FrontFootL", "FrontFootR")
 	body.Stance.BL, body.Stance.BR = stance("BackToesL", "BackToesR")
+	body.Joint, body.Reach = {}, {}
 	for leg, bones in BACK_BONES do
 		body.Meta[leg] = body.Rest[bones[4]].Position - body.Rest[bones[3]].Position
+		body.Joint[leg] = body.Rest[bones[1]].Position
+		body.Reach[leg] = (body.Length[bones[1]] or 1) + (body.Length[bones[2]] or 1)
 	end
+	for leg, bones in FRONT_BONES do
+		body.Joint[leg] = body.Rest[bones[1]].Position
+		body.Reach[leg] = (body.Length[bones[1]] or 1) + (body.Length[bones[2]] or 1)
+	end
+	-- The model stands with its legs almost straight (some can't even reach the averaged stance).
+	-- Standing a little lower, pull each foot in under its shoulder / hip until the leg has some
+	-- bend, so the IK never locks straight and there is reach left to walk with.
+	for _, leg in LEGS do
+		local joint = body.Joint[leg] - UP * STAND_DROP
+		local endOffset = if FRONT[leg] then Vector3.zero else -body.Meta[leg]
+		local target = body.Stance[leg]
+		local under = Vector3.new(joint.X, target.Y, joint.Z)
+		for _ = 1, 20 do
+			if (target + endOffset - joint).Magnitude <= body.Reach[leg] * LEG_SLACK then
+				break
+			end
+			target = target:Lerp(under, 0.15)
+		end
+		body.Stance[leg] = target
+		-- Walking, each foot sweeps evenly about the point under its own shoulder / hip (the model's
+		-- shoulders aren't level fore and aft: it was posed mid-stride).
+		body.Stride[leg] = Vector3.new(target.X, target.Y, body.Joint[leg].Z - endOffset.Z)
+	end
+	body.GirdleZ = { Front = (body.Joint.FL.Z + body.Joint.FR.Z) / 2, Hind = (body.Joint.BL.Z + body.Joint.BR.Z) / 2 }
 	for i = 1, TAIL_SEGMENTS do
 		table.insert(body.TailLengths, body.Length["Tail" .. i])
 	end
@@ -423,7 +493,15 @@ end
 -- `lower`, bending toward `bend`. Clamps the end within reach and returns the (possibly moved) end.
 local function solveLimb(root: Vector3, target: Vector3, bend: Vector3, upper: number, lower: number): (Vector3, Vector3)
 	local offset = target - root
-	local distance = math.clamp(offset.Magnitude, math.abs(upper - lower) + 0.05, upper + lower - 0.02)
+	-- Near full stretch the joint angle changes ever faster for the same reach, so the last bit of
+	-- reach is approached exponentially (soft IK) and the knee never snaps straight.
+	local full = upper + lower - 0.02
+	local soft = SOFT_IK * full
+	local distance = offset.Magnitude
+	if distance > full - soft then
+		distance = full - soft * math.exp((full - soft - distance) / soft)
+	end
+	distance = math.max(distance, math.abs(upper - lower) + 0.05)
 	local dir = unitOr(offset, -UP)
 	target = root + dir * distance
 	local along = (upper * upper - lower * lower + distance * distance) / (2 * distance)
@@ -441,6 +519,8 @@ type Spine = {
 	HeadPitch: number,
 	HeadYaw: number,
 	NeckShift: number,
+	TailYaw: number, -- swings out of a turn
+	TailPitch: number, -- up as a counterweight (gallop, braking)
 }
 
 -- Poses the rig. `frame` is the body centre (Config.BodyHeight above the model origin), `ground`
@@ -505,7 +585,8 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 		local side = SIDE[leg]
 		local upper, lower, paw = bones[1], bones[2], bones[3]
 		if posed.Chest and relative[upper] then
-			local shoulder = (posed.Chest * relative[upper]).Position
+			-- The shoulder blade slides with the stride (the leg alone can't reach far enough).
+			local shoulder = (posed.Chest * relative[upper]).Position + chestBasis:VectorToWorldSpace(view.Feet[leg].Girdle)
 			local bend = chestBasis:VectorToWorldSpace(Vector3.new(side * 0.3, 0, 1))
 			local elbow, wrist = solveLimb(shoulder, view.Feet[leg].Position, bend, body.Length[upper], body.Length[lower])
 			aim(upper, shoulder, elbow, chestBasis)
@@ -522,7 +603,7 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 		if posed.Hips and relative[thigh] then
 			local lifted = view.Feet[leg].Lifted
 			local basis = if pose.Flight >= 0 or pose.Collapse > 0.5 then modelCF else ground:Lerp(modelCF, lifted * 0.6)
-			local hip = (posed.Hips * relative[thigh]).Position
+			local hip = (posed.Hips * relative[thigh]).Position + modelCF:VectorToWorldSpace(view.Feet[leg].Girdle)
 			local metaWorld = basis:VectorToWorldSpace(body.Meta[leg])
 			local bend = modelCF:VectorToWorldSpace(Vector3.new(side * 0.3, 0, -1))
 			local knee, hock = solveLimb(hip, view.Feet[leg].Position - metaWorld, bend, body.Length[thigh], body.Length[shin])
@@ -539,7 +620,7 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 	local points, velocities = view.Tail, view.TailVelocity
 	local hipsFrame = posed.Hips or modelCF
 	local base = if relative.Tail1 then (hipsFrame * relative.Tail1).Position else frame.Position
-	local tailBasis = modelCF * CFrame.Angles(0, -0.35 * spine.Bend, 0)
+	local tailBasis = modelCF * CFrame.Angles(0, -0.35 * spine.Bend + spine.TailYaw, 0)
 	local limp = pose.Collapse
 	if #points == 0 then
 		points[1] = base
@@ -551,9 +632,8 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 	end
 	points[1] = base
 	local floorY = ground.Position.Y + 0.2
-	local gallop = view.GaitWeights[3]
-	local raise = CFrame.Angles(0.12 * gallop, 0, 0)
-	local swayAngle = math.sin(view.Cycle * 2 * math.pi) * 0.12 * (1 - gallop) * clamp01(flat(view.Velocity).Magnitude / 6)
+	local raise = CFrame.Angles(spine.TailPitch, 0, 0)
+	local swayAngle = math.sin(view.Cycle * 2 * math.pi) * 0.12 * (1 - view.GaitWeights[3]) * clamp01(flat(view.Velocity).Magnitude / 6)
 	local stiffness = 180 * (1 - limp) + 4
 	local gravity = 6 + 60 * limp
 	local h = math.min(dt, 1 / 30)
@@ -822,16 +902,62 @@ local function blendOffset(weights: { number }, leg: string): number
 	return (math.atan2(y, x) / (2 * math.pi)) % 1
 end
 
+-- A value from a table of { x, y } points, linearly between them.
+local function lookup(points: { { number } }, x: number): number
+	if x <= points[1][1] then
+		return points[1][2]
+	end
+	for i = 2, #points do
+		local a, b = points[i - 1], points[i]
+		if x <= b[1] then
+			return a[2] + (b[2] - a[2]) * (x - a[1]) / (b[1] - a[1])
+		end
+	end
+	return points[#points][2]
+end
+
 -- Where a foot stands (world) for the body standing at `ground`.
 local function neutralFoot(view: View, ground: CFrame, leg: string): Vector3
 	return ground * view.Body.Stance[leg]
 end
 
-local function startSwing(foot: Foot, duration: number, clock: number)
+-- How a point fixed on the ground moves in the body's ground frame, the body moving at `velocity`
+-- (that frame) and turning at `yawRate` (studs/s).
+local function stillRate(point: Vector3, velocity: Vector3, yawRate: number): Vector3
+	return -(velocity + Vector3.new(yawRate * point.Z, 0, -yawRate * point.X))
+end
+
+local function hermite(p0: Vector3, m0: Vector3, p1: Vector3, m1: Vector3, s: number): Vector3
+	local s2, s3 = s * s, s * s * s
+	return p0 * (2 * s3 - 3 * s2 + 1) + m0 * (s3 - 2 * s2 + s) + p1 * (3 * s2 - 2 * s3) + m1 * (s3 - s2)
+end
+
+local function startSwing(foot: Foot, duration: number, clock: number, ground: CFrame, velocity: Vector3, yawRate: number)
 	foot.Swinging = true
 	foot.From = foot.Position
+	foot.FromLocal = ground:PointToObjectSpace(foot.Position)
+	foot.FromRate = stillRate(foot.FromLocal, ground:VectorToObjectSpace(velocity), yawRate)
 	foot.SwingStart = clock
 	foot.SwingTime = duration
+end
+
+-- The ground frame `tau` seconds from now, carried along the arc the body is moving on.
+local function predictGround(ground: CFrame, velocity: Vector3, yawRate: number, tau: number): CFrame
+	local turn = math.clamp(yawRate * tau, -1.2, 1.2)
+	local half = turn / 2
+	local chord = if math.abs(half) > 1e-4 then math.sin(half) / half else 1
+	local travel = CFrame.Angles(0, half, 0):VectorToWorldSpace(velocity) * (tau * chord)
+	return (ground + travel) * CFrame.Angles(0, turn, 0)
+end
+
+-- How far a foot can be from under its shoulder / hip (studs, along the ground) with the body `drop`
+-- studs lower than rest, before the leg is straight.
+local function legReach(body: Body, leg: string, drop: number): number
+	local joint = body.Joint[leg]
+	local stance = body.Stance[leg] + (if FRONT[leg] then Vector3.zero else -body.Meta[leg])
+	local height = joint.Y - drop - stance.Y
+	local length = body.Reach[leg] * 0.97
+	return math.sqrt(math.max(length * length - height * height, 0))
 end
 
 local function updateView(view: View, dt: number, t: number)
@@ -841,9 +967,10 @@ local function updateView(view: View, dt: number, t: number)
 		return
 	end
 	local clock = os.clock()
-	local pose, action, step = actionPose(view, t)
+	local body = view.Body
+	local pose = actionPose(view, t)
 
-	-- Ease out the jump when the action changes (the targets themselves are exact).
+	-- Ease out the jump when the action changes (the targets themselves stay exact).
 	if view.PendingBlend then
 		view.PendingBlend = false
 		for _, key in BLENDED do
@@ -874,9 +1001,23 @@ local function updateView(view: View, dt: number, t: number)
 	end
 
 	-- 1. The body: on springs onto the server hitbox; a lunge's flight is drawn from its exact arc.
-	local previousVelocity = view.Velocity
 	local flying = pose.Flight >= 0
 	local leapLift = 0
+	local before = view.Position
+	-- The server moves an anchored hitbox, so its position arrives in steps. A low-passed copy of it
+	-- trails it by velocity / TRACK.Rate, which gives a smooth velocity estimate; the body follows
+	-- the hitbox carried on at part of that velocity since the last step, so it neither stutters
+	-- with the steps nor trails far behind at speed.
+	local hitbox = root.Position
+	if hitbox ~= view.LastTarget then
+		local gap = clock - view.LastTargetAt
+		if gap < 0.2 then
+			view.StepGap += (gap - view.StepGap) * 0.2
+		end
+		view.LastTarget, view.LastTargetAt = hitbox, clock
+	end
+	view.Trail += (hitbox - view.Trail) * (1 - math.exp(-TRACK.Rate * dt))
+	view.TargetVelocity, view.TargetAccel = springVector(view.TargetVelocity, view.TargetAccel, (hitbox - view.Trail) * TRACK.Rate, TRACK.Smooth, dt)
 	if flying then
 		local from = attribute(server, "LeapFrom", root.Position)
 		local to = attribute(server, "LeapTo", root.Position)
@@ -891,22 +1032,40 @@ local function updateView(view: View, dt: number, t: number)
 			view.Yaw = view.Yaw + wrapAngle(yawOf(along) - view.Yaw)
 		end
 		view.YawRate = 0
-		pose.Pitch += math.atan2(view.Velocity.Y, math.max(flat(view.Velocity).Magnitude, 1))
+		-- Pitches with the arc (a little less than the arc itself: the body stays level-ish).
+		pose.Pitch += 0.7 * math.atan2(view.Velocity.Y, math.max(flat(view.Velocity).Magnitude, 1))
 	else
-		view.Position, view.Velocity = springVector(view.Position, view.Velocity, root.Position, FOLLOW_RATE, dt)
+		local age = clock - view.LastTargetAt
+		local overdue = math.max(0.045, TRACK.StopAfter * view.StepGap)
+		local feed = view.TargetVelocity * (TRACK.Feed * clamp01(1 - (age - overdue) / 0.03))
+		local carried = hitbox + feed * math.min(age, TRACK.Carry * view.StepGap)
+		-- (The lag is measured from where the carried hitbox was a frame ago, so only its surprises
+		-- - a step that doesn't match the estimate - go through the spring.)
+		local lag, lagRate = springVector(view.Position + feed * dt - carried, view.Velocity - feed, Vector3.zero, FOLLOW_RATE, dt)
+		view.Position, view.Velocity = carried + lag, feed + lagRate
 		local want = view.Yaw + wrapAngle(yawOf(flat(root.CFrame.LookVector)) - view.Yaw)
 		view.Yaw, view.YawRate = spring(view.Yaw, view.YawRate, want, TURN_RATE, dt)
 	end
-	view.Accel = view.Accel:Lerp((view.Velocity - previousVelocity) / dt, math.min(dt * 12, 1))
+	if flying ~= view.Flying then
+		-- The flight usually starts a frame or two late (latency): ease the jump out instead of popping.
+		view.Flying = flying
+		view.Offset = (before + view.Offset * math.exp(-POSITION_BLEND * (clock - view.OffsetStart))) - view.Position
+		view.OffsetStart = clock
+	end
+	local offset = view.Offset * math.exp(-POSITION_BLEND * (clock - view.OffsetStart))
+	local centre = view.Position + offset
+	-- (The estimate's own rate of change ripples with the replication steps; the lean wants the
+	-- underlying trend.)
+	view.Accel, view.AccelRate = springVector(view.Accel, view.AccelRate, if flying then Vector3.zero else view.TargetAccel, ACCEL_RATE, dt)
 	local heading = CFrame.Angles(0, view.Yaw, 0).LookVector
-	local right = heading:Cross(UP)
 	local groundVelocity = flat(view.Velocity)
 	local speed = groundVelocity.Magnitude
+	local alive = 1 - pose.Collapse
 
-	-- 2. Gait: which gait, how fast the cycle turns, and the body's rhythm.
+	-- 2. Gait: which gait, how fast the cycle turns, how low it rides, and the body's rhythm.
 	local weights = gaitWeights(speed)
 	for i = 1, #weights do
-		view.GaitWeights[i] += (weights[i] - view.GaitWeights[i]) * math.min(dt * 6, 1)
+		view.GaitWeights[i] += (weights[i] - view.GaitWeights[i]) * math.min(dt * 5, 1)
 	end
 	weights = view.GaitWeights
 	if view.Moving then
@@ -914,55 +1073,80 @@ local function updateView(view: View, dt: number, t: number)
 	else
 		view.Moving = speed > MOVE_ON
 	end
-	local rate = STRIDE_RATE.Base + STRIDE_RATE.PerStud * speed
-	local duty = blendGait(weights, "Duty")
+	local stepping = clamp01(speed / 5) * (if flying then 0 else 1)
+	local dropF = STAND_DROP + (blendGait(weights, "DropF") - STAND_DROP) * stepping
+	local dropH = STAND_DROP + (blendGait(weights, "DropH") - STAND_DROP) * stepping
+	-- (Lowering the shoulders more than the hips pitches the body, about its centre.)
+	local dropPitch = (dropH - dropF) / (body.GirdleZ.Hind - body.GirdleZ.Front)
+	local drop = dropF - body.GirdleZ.Front * dropPitch
+	local duty = lookup(DUTY, speed)
+	-- Step faster rather than over-stretch: each stance can only sweep as far as the legs reach
+	-- (plus the shoulder blades' and pelvis's travel).
+	local reach = math.min(legReach(body, "FL", dropF) + GIRDLE.Front, legReach(body, "BL", dropH) + GIRDLE.Hind)
+	local rate = math.max(lookup(STRIDE_RATE, speed), speed * duty / math.max(2 * reach * 0.85, 0.5))
 	if view.Moving and not flying then
 		view.Cycle += dt * rate
 	end
-	local stepping = clamp01(speed / 5) * (if flying then 0 else 1)
 	local phase = view.Cycle % 1
+	local gallop = weights[3]
+	local walkish = weights[1]
 	local bob = 0
 	for i, gait in GAITS do
-		bob += gait.Bob * weights[i] * math.cos(2 * math.pi * (gait.BobRate * phase))
+		bob += gait.Bob * weights[i] * math.cos(2 * math.pi * gait.BobRate * (phase - gait.BobAt))
 	end
 	bob *= stepping
-	local gallop = weights[3]
-	local gaitFlex = math.sin(2 * math.pi * (phase - 0.15)) * blendGait(weights, "Flex") * stepping
-	local gaitPitch = math.sin(2 * math.pi * (phase - 0.3)) * 0.07 * gallop * stepping
-	local gaitRoll = math.sin(2 * math.pi * phase) * 0.035 * (1 - gallop) * stepping
-	local breathe = math.sin(t * 2.1) * 0.035 * (1 - stepping)
-	local sway = math.sin(t * 0.37) * 0.02 * (1 - stepping)
+	-- Gallop: the spine arches in the gathered flight (phase ~0.9) and extends after the hind push
+	-- (~0.4), flexing about twice as far as it extends; the body rocks nose-up at the push.
+	local gallopSpeed = clamp01((speed - 15) / 15) * 0.6 + 0.4
+	local arch = math.cos(2 * math.pi * (phase - 0.9))
+	local gaitFlex = (0.67 * arch + 0.33) * 0.42 * gallop * gallopSpeed * stepping
+	local gaitPitch = math.cos(2 * math.pi * (phase - 0.42)) * 0.1 * gallop * stepping
+		+ math.cos(4 * math.pi * (phase - 0.1)) * 0.025 * walkish * stepping
+	-- Walk: the pelvis rolls with the swinging hind leg and the spine snakes a little.
+	local gaitRoll = math.sin(2 * math.pi * phase) * 0.05 * (1 - gallop) * stepping
+	local gaitSnake = math.sin(2 * math.pi * (phase + 0.25)) * 0.06 * walkish * stepping
+	local breathe = math.sin(t * 2.1) * 0.02 * (1 - stepping)
 
-	-- Dynamics: banks into turns, leans into acceleration, the spine bends into the turn.
-	local lateral = view.Accel:Dot(right)
-	local forward = view.Accel:Dot(heading)
+	-- Idle life: weight shifts now and then, and the head scans about.
+	if clock >= view.WeightUntil then
+		view.WeightUntil = clock + SHIFT.Every[1] + math.random() * (SHIFT.Every[2] - SHIFT.Every[1])
+		view.WeightGoal = Vector2.new((math.random() * 2 - 1) * SHIFT.Side, (math.random() * 2 - 1) * SHIFT.Fore)
+	end
+	view.Weight = view.Weight:Lerp(view.WeightGoal * (1 - stepping), math.min(dt * 2.5, 1))
+
+	-- Dynamics: banks into turns, leans into acceleration, the spine bends into the turn with the
+	-- pelvis following a beat later.
 	local grounded = if flying then 0 else 1
-	local bank = -math.clamp(math.atan(lateral / BANK_G) * BANK, -MAX_BANK, MAX_BANK) * grounded * (1 - pose.Collapse)
-	local lean = -math.clamp(forward * LEAN, -MAX_LEAN, MAX_LEAN) * grounded
-	local bend = math.clamp(view.YawRate * SPINE_BEND, -MAX_SPINE_BEND, MAX_SPINE_BEND) * grounded * (1 - pose.Collapse)
+	local forward = view.Accel:Dot(heading)
+	local bankTarget = -math.clamp(BANK.Gain * math.atan(speed * view.YawRate / G), -BANK.Max, BANK.Max) * smooth((speed - 4) / 8) * grounded * alive
+	view.Bank, view.BankRate = spring(view.Bank, view.BankRate, bankTarget, BANK.Rate, dt)
+	local lean = if forward > 0 then -math.min(LEAN.Forward * forward / G, LEAN.Max) else math.min(LEAN.Brake * -forward / G, LEAN.Max)
+	lean *= grounded * alive
+	local leanDrop = math.min(LEAN.Drop * math.abs(forward) / G, 0.27) * grounded * alive
+	local bend = math.clamp(view.YawRate * SPINE_BEND.Reach / math.max(speed, 6), -SPINE_BEND.Max, SPINE_BEND.Max) * grounded * alive
+	view.HipsBend, view.HipsBendRate = spring(view.HipsBend, view.HipsBendRate, bend, SPINE_BEND.Rate, dt)
 
 	-- 3. The body frame.
 	local floor = view.Position - UP * (Config.BodyHeight + leapLift)
 	local ground = CFrame.new(floor) * CFrame.Angles(0, view.Yaw, 0)
-	local wiggle = pose.Wiggle * math.sin(clock * 17) * 0.09
-	local frame = CFrame.new(view.Position)
+	local wiggle = pose.Wiggle * math.sin(clock * 25) * 0.07
+	local frame = CFrame.new(centre)
 		* CFrame.Angles(0, view.Yaw, 0)
-		* CFrame.new(0, breathe + bob - pose.Crouch, -pose.Shift)
-		* CFrame.Angles(pose.Pitch + lean + gaitPitch - 0.25 * pose.Buckle, wiggle, pose.Roll + bank + gaitRoll + sway)
+		* CFrame.new(view.Weight.X, breathe + bob - pose.Crouch - drop - leanDrop, -pose.Shift - view.Weight.Y)
+		* CFrame.Angles(pose.Pitch + lean + gaitPitch + dropPitch - 0.25 * pose.Buckle, wiggle, pose.Roll + view.Bank + gaitRoll)
 		* CFrame.new(0, -0.5 * pose.Buckle, 0)
 
-	-- 4. Feet. Planted feet stay put in the world; the gait phase decides when each lifts off,
-	-- and it swings to where it should be half a stance from now (so it passes under the body).
+	-- 4. Feet. Planted feet stay put in the world; the gait phase decides when each lifts off, and
+	-- it swings to where the body will be over it half a stance after it lands (following the body's
+	-- turn as well as its travel), so it passes under the body. The shoulder blades and pelvis
+	-- travel with their legs.
 	local stanceTime = duty / math.max(rate, 0.1)
-	local swingTime = math.clamp((1 - duty) / math.max(rate, 0.1), 0.12, 0.45)
-	local lift = blendGait(weights, "Lift")
-	local ahead = groundVelocity * (stanceTime * LAND_AHEAD)
-	if ahead.Magnitude > MAX_LAND_AHEAD then
-		ahead = ahead.Unit * MAX_LAND_AHEAD
-	end
+	local swingTime = math.clamp((1 - duty) / math.max(rate, 0.1), 0.14, 0.42)
+	local liftF, liftH = blendGait(weights, "LiftF"), blendGait(weights, "LiftH")
+	local halfStance = math.min(stanceTime * 0.5, reach * 0.85 / math.max(speed, 0.1))
 	-- Standing still: the foot that is furthest off steps back under the body (one at a time).
 	local idleStepper: string? = nil
-	if not view.Moving and not flying then
+	if not view.Moving and not flying and pose.Collapse <= 0 then
 		local busy = false
 		local worst = IDLE_STEP_ERROR
 		for _, leg in LEGS do
@@ -980,23 +1164,38 @@ local function updateView(view: View, dt: number, t: number)
 			idleStepper = nil
 		end
 	end
+	local bodyAtFloor = frame * CFrame.new(0, -Config.BodyHeight, 0)
 	for _, leg in LEGS do
 		local foot = view.Feet[leg]
 		local side = SIDE[leg]
+		local front = FRONT[leg]
 		local neutral = neutralFoot(view, ground, leg)
-		if pose.Gather > 0 and not FRONT[leg] then
+		if pose.Gather > 0 and not front then
 			neutral += heading * (0.5 * pose.Gather)
 		end
-		-- Lift-off: once per gait cycle at its phase, or an idle corrective step.
+		local home = neutral:Lerp(ground * body.Stride[leg], stepping)
 		local cycle = view.Cycle + blendOffset(weights, leg)
 		local legPhase = cycle % 1
 		local cycleIndex = math.floor(cycle)
+		-- The shoulder blade / pelvis: forward at touchdown, back at lift-off, returning in the
+		-- swing; the stance-side shoulder rises a little (the prowling shoulder roll).
+		local travel = if legPhase < duty then math.cos(math.pi * legPhase / duty) else -math.cos(math.pi * (legPhase - duty) / (1 - duty))
+		local rise = if legPhase < duty then math.sin(math.pi * legPhase / duty) else 0
+		local amount = (if front then GIRDLE.Front else GIRDLE.Hind) * stepping * alive
+		foot.Girdle = Vector3.new(0, (if front then GIRDLE.Rise else GIRDLE.Rise * 0.5) * rise * stepping * alive, -amount * travel)
+		-- Lift-off: once per gait cycle at its phase, early if the leg is about to over-stretch,
+		-- or an idle corrective step.
 		if not foot.Swinging and not flying then
-			if view.Moving and legPhase >= duty and foot.Cycle ~= cycleIndex then
-				foot.Cycle = cycleIndex
-				startSwing(foot, swingTime, clock)
-			elseif leg == idleStepper then
-				startSwing(foot, IDLE_STEP_TIME, clock)
+			local joint = bodyAtFloor * (body.Joint[leg] + foot.Girdle)
+			local endPoint = foot.Plant + (if front then Vector3.zero else -bodyAtFloor:VectorToWorldSpace(body.Meta[leg]))
+			local stretched = (endPoint - joint).Magnitude > body.Reach[leg] * 0.99
+			if view.Moving and ((legPhase >= duty and foot.Cycle ~= cycleIndex) or stretched) then
+				foot.Cycle = if legPhase >= duty then cycleIndex else cycleIndex - 1
+				startSwing(foot, swingTime, clock, ground, groundVelocity, view.YawRate)
+				foot.Landing = predictGround(ground, groundVelocity, view.YawRate, swingTime + halfStance) * ground:PointToObjectSpace(home)
+			elseif leg == idleStepper or (stretched and not view.Moving) then
+				startSwing(foot, IDLE_STEP_TIME, clock, ground, groundVelocity, view.YawRate)
+				foot.Landing = neutral
 			elseif (foot.Plant - neutral).Magnitude > MAX_PLANT_ERROR then
 				foot.Plant = neutral -- teleported: catch up at once
 			end
@@ -1004,42 +1203,55 @@ local function updateView(view: View, dt: number, t: number)
 		local position
 		if foot.Swinging then
 			local s = clamp01((clock - foot.SwingStart) / foot.SwingTime)
-			local landing = neutral + (if view.Moving then ahead else Vector3.zero)
-			landing = Vector3.new(landing.X, floor.Y, landing.Z)
-			local e = smooth(s)
-			local height = (if view.Moving then lift * stepping + 0.12 else 0.22) * math.sin(math.pi * s) ^ 0.8
-			position = foot.From:Lerp(landing, e) + UP * height
-			foot.Lifted = math.sin(math.pi * math.min(s * 1.15, 1))
+			if s < RETARGET_UNTIL then
+				foot.Landing = if view.Moving
+					then predictGround(ground, groundVelocity, view.YawRate, (1 - s) * foot.SwingTime + halfStance) * ground:PointToObjectSpace(home)
+					else neutral
+			end
+			-- The path is drawn in the body's frame, from where the paw left to where it will land
+			-- (as the body will be then), leaving and arriving at the ground's speed in that frame:
+			-- so the paw lifts off and sets down at rest, trailing back after lift-off and reaching
+			-- out past the landing spot before settling onto it, and it follows the body round a
+			-- turn instead of cutting under it. Up: lifts briskly, peaks early (38% of the swing) and
+			-- sets down softly.
+			local touchdown = predictGround(ground, groundVelocity, view.YawRate, (1 - s) * foot.SwingTime)
+			local landing = touchdown:PointToObjectSpace(foot.Landing)
+			local landingRate = stillRate(landing, ground:VectorToObjectSpace(groundVelocity), view.YawRate)
+			local path = hermite(foot.FromLocal, foot.FromRate * foot.SwingTime, landing, landingRate * foot.SwingTime, s)
+			local lift = if view.Moving then (if front then liftF else liftH) * stepping + 0.08 else 0.2
+			local height = lift * SWING_LIFT * s * s * (1 - s) ^ 3.2
+			position = ground * path + UP * height
+			-- The paw peels off the floor and lands flat a little before touchdown, easing both ways.
+			foot.Lifted = smooth(math.min(s, 0.9 - s) / 0.3)
 			if s >= 1 then
 				foot.Swinging = false
-				foot.Plant = landing
-				position = landing
+				foot.Plant = foot.Landing
+				position = foot.Landing
 				foot.Lifted = 0
 			end
 		else
 			position = foot.Plant
 			foot.Lifted = 0
 		end
-		-- Attack poses take over a foot smoothly (and give it back to a fresh plant).
+		-- Attack poses take over a foot smoothly, and give it back just as smoothly.
 		local override: Vector3? = nil
 		local want = 0
 		local swipe = if leg == "FL" then pose.LeftSwipe elseif leg == "FR" then pose.RightSwipe else nil
 		if flying then
-			local pair = if FRONT[leg] then FLIGHT_FRONT else FLIGHT_BACK
+			local pair = if front then FLIGHT_FRONT else FLIGHT_BACK
 			override = frame * mirror(pair[1]:Lerp(pair[2], smooth(pose.Flight)), side)
 			want = 1
 		elseif pose.Collapse > 0 then
 			-- Dying: the legs go limp, splayed from the body.
-			local limp = view.Body.Stance[leg] + Vector3.new(side * 0.6, 0.6, if FRONT[leg] then -0.4 else 0.4)
-			override = frame * (CFrame.new(0, -Config.BodyHeight, 0) * limp)
+			local limp = body.Stance[leg] + Vector3.new(side * 0.6, 0.6, if front then -0.4 else 0.4)
+			override = bodyAtFloor * limp
 			want = pose.Collapse
 		elseif swipe then
 			local restLocal = frame:PointToObjectSpace(position)
 			override = frame * swipeFoot(restLocal, side, swipe)
-			want = swipe.Wind * (1 - swipe.Back) + (1 - swipe.Back) * swipe.Sweep
-			want = clamp01(want)
-		elseif FRONT[leg] and pose.Buckle > 0 then
-			override = ground * (view.Body.Stance[leg] + Vector3.new(side * 0.3, 0, -0.55))
+			want = clamp01(swipe.Wind * (1 - swipe.Back) + (1 - swipe.Back) * swipe.Sweep)
+		elseif front and pose.Buckle > 0 then
+			override = ground * (body.Stance[leg] + Vector3.new(side * 0.3, 0, -0.55))
 			want = pose.Buckle
 		end
 		local held = view.Overrides[leg]
@@ -1048,47 +1260,57 @@ local function updateView(view: View, dt: number, t: number)
 			held = 0
 		end
 		view.Overrides[leg] = held
-		if override and held > 0 then
-			position = position:Lerp(override, held)
-			foot.Lifted = math.max(foot.Lifted, held)
-		elseif held > 0 then
-			-- The pose has let go: the foot comes down onto its plant.
+		if override then
+			foot.Held = override
+		end
+		if held > 0 then
+			position = position:Lerp(foot.Held, held)
 			foot.Lifted = math.max(foot.Lifted, held)
 		end
 		if held > 0.5 and (flying or pose.Collapse > 0) then
 			-- Off the ground for now: when it comes back, it lands under the body.
 			foot.Swinging = false
-			foot.Plant = Vector3.new(neutral.X, floor.Y, neutral.Z)
+			foot.Plant = neutral
+		end
+		if pose.Collapse > 0 then
+			position = Vector3.new(position.X, math.max(position.Y, floor.Y + 0.15), position.Z)
 		end
 		foot.Position = position
 	end
 
-	-- 5. Head: steady while the body bobs, tracking the nearest player with a little overshoot.
+	-- 5. Head: steady while the body bobs, leading into turns, tracking the nearest player with a
+	-- little overshoot, or scanning about when nobody is near.
 	local target = nearestPlayer(view.Position, Config.DetectRange)
-	local lookYaw, lookPitch = math.sin(t * 0.45) * 0.4, 0
+	local lookYaw, lookPitch
 	if target then
-		local offset = target - view.Position
-		local along = unitOr(flat(offset), heading)
-		lookYaw = math.clamp(math.atan2(heading:Cross(along).Y, heading:Dot(along)), -LOOK.MaxYaw, LOOK.MaxYaw)
-		lookPitch = math.clamp(math.atan2(offset.Y, flat(offset).Magnitude), -LOOK.MaxPitch, LOOK.MaxPitch)
+		local toTarget = target - view.Position
+		local along = unitOr(flat(toTarget), heading)
+		lookYaw = math.atan2(heading:Cross(along).Y, heading:Dot(along))
+		lookPitch = math.atan2(toTarget.Y, flat(toTarget).Magnitude)
+	else
+		if clock >= view.GazeUntil then
+			view.GazeUntil = clock + SCAN.Hold[1] + math.random() * (SCAN.Hold[2] - SCAN.Hold[1])
+			view.Gaze = Vector2.new((math.random() * 2 - 1) * SCAN.Yaw, (math.random() * 2 - 1) * SCAN.Pitch)
+		end
+		lookYaw, lookPitch = view.Gaze.X, view.Gaze.Y
 	end
-	if pose.Collapse > 0 then
-		lookYaw, lookPitch = 0, 0
-	end
-	-- The body's own turn leads the eyes less: subtract the spine's bend toward the turn.
-	view.LookYaw, view.LookYawRate = wobbleSpring(view.LookYaw, view.LookYawRate, lookYaw - 0.5 * bend, LOOK.Omega, LOOK.Damping, dt)
+	lookYaw = math.clamp(lookYaw + view.YawRate * LOOK.Lead, -LOOK.MaxYaw, LOOK.MaxYaw) * alive
+	lookPitch = math.clamp(lookPitch, -LOOK.MaxPitch, LOOK.MaxPitch) * alive
+	view.LookYaw, view.LookYawRate = wobbleSpring(view.LookYaw, view.LookYawRate, lookYaw - bend * 0.5, LOOK.Omega, LOOK.Damping, dt)
 	view.LookPitch, view.LookPitchRate = wobbleSpring(view.LookPitch, view.LookPitchRate, lookPitch, LOOK.Omega, LOOK.Damping, dt)
-	-- Undo the body's rhythmic pitch and bob at the neck so the head rides level.
-	local steady = -(gaitPitch + lean + bob * 0.25) * (1 - pose.Collapse)
+	-- Undo the body's rhythmic pitch, lean and bob at the neck so the head rides level.
+	local steady = -(gaitPitch + lean + bob * 0.3) * alive
 	local spine: Spine = {
-		Bend = bend,
+		Bend = bend * 0.5 + view.HipsBend * 0.5 + gaitSnake,
 		Flex = pose.Flex + gaitFlex,
 		Roll = gaitRoll * 0.8,
 		Twist = pose.Twist,
-		NeckPitch = 0.45 * (pose.HeadPitch + view.LookPitch) - 0.35 * pose.NeckPush + 0.7 * steady,
-		HeadPitch = 0.55 * (pose.HeadPitch + view.LookPitch) + 0.3 * pose.NeckPush + 0.3 * steady,
+		NeckPitch = 0.6 * (pose.HeadPitch + view.LookPitch) - 0.35 * pose.NeckPush + 0.7 * steady,
+		HeadPitch = 0.4 * (pose.HeadPitch + view.LookPitch) + 0.3 * pose.NeckPush + 0.3 * steady,
 		HeadYaw = view.LookYaw + pose.HeadTurn,
-		NeckShift = 0.12 * pose.NeckPush,
+		NeckShift = 0.06 * pose.NeckPush,
+		TailYaw = math.clamp(-0.17 * view.YawRate, -0.8, 0.8) * alive,
+		TailPitch = (0.12 * gallop * stepping + math.clamp(-forward / 80, 0, 1) * 0.4 - 0.6 * gaitPitch) * alive,
 	}
 
 	applyBody(view, frame, ground, pose, spine, dt)
@@ -1164,7 +1386,21 @@ local function track(server: Model)
 	local feet: { [string]: Foot } = {}
 	for _, leg in LEGS do
 		local plant = ground * body.Stance[leg]
-		feet[leg] = { Plant = plant, Swinging = false, From = plant, SwingStart = 0, SwingTime = 0.3, Cycle = -1, Position = plant, Lifted = 0 }
+		feet[leg] = {
+			Plant = plant,
+			Swinging = false,
+			From = plant,
+			FromLocal = Vector3.zero,
+			FromRate = Vector3.zero,
+			SwingStart = 0,
+			SwingTime = 0.3,
+			Cycle = -1,
+			Landing = plant,
+			Position = plant,
+			Lifted = 0,
+			Girdle = Vector3.zero,
+			Held = plant,
+		}
 	end
 	local view: View = {
 		Server = server,
@@ -1172,6 +1408,7 @@ local function track(server: Model)
 		Position = root.Position,
 		Velocity = Vector3.zero,
 		Accel = Vector3.zero,
+		AccelRate = Vector3.zero,
 		Yaw = yaw,
 		YawRate = 0,
 		Cycle = math.random(),
@@ -1179,6 +1416,24 @@ local function track(server: Model)
 		GaitWeights = { 1, 0, 0 },
 		Feet = feet,
 		Overrides = { FL = 0, FR = 0, BL = 0, BR = 0 },
+		Flying = false,
+		Trail = root.Position,
+		TargetVelocity = Vector3.zero,
+		TargetAccel = Vector3.zero,
+		LastTarget = root.Position,
+		LastTargetAt = os.clock(),
+		StepGap = 1 / 30,
+		Offset = Vector3.zero,
+		OffsetStart = 0,
+		Bank = 0,
+		BankRate = 0,
+		HipsBend = 0,
+		HipsBendRate = 0,
+		Gaze = Vector2.zero,
+		GazeUntil = 0,
+		Weight = Vector2.zero,
+		WeightGoal = Vector2.zero,
+		WeightUntil = 0,
 		Tail = {},
 		TailVelocity = {},
 		LookYaw = 0,
