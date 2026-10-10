@@ -323,17 +323,19 @@ end
 -- EXPLODING (stormBurst): a flash, splash rings, mist and droplets bursting out, stretching as they
 -- fly and falling. A parried bolt comes back as the same thing in the player's attack colour
 -- ("ReflectedStormBolt").
--- The droplets are real parts (a glowing ball with a stretched ellipsoid tail, see newDroplet) so
--- they keep their teardrop shape and point the way they move; the streams are Trails on
--- attachments that orbit every frame.
+-- A droplet is a glowing ball (a part with a sphere mesh, scaled rather than resized) with a
+-- camera-facing Beam tail tapering to a point, so it reads as a teardrop from any angle and points
+-- the way it moves (see newDroplet). The streams are Trails on attachments that orbit every frame.
 local BOLT_EDGE = Color3.fromRGB(70, 140, 255) -- deep blue edge of the Stormfin's own bolt
 local BOLT_LENGTH = 9 -- studs of comet glow behind the head
 local BOLT_SCALE = 0.55 -- overall size of the effect relative to the hit radius (user: it was too large)
-local DROPLET_ALPHA = { 0.15, 0.4 } -- ball, tail: glowing water, the tail thinner
-local SHELL_ALPHA = { 0.72, 0.82 } -- the see-through bubble round the bolt's core
+local DROPLET_ALPHA = 0.15 -- glowing water...
+local TAIL_ALPHA = 0.35 -- ...its tail a little thinner, fading to nothing at the point
+local SHELL_ALPHA = 0.72 -- the see-through bubble round the orb and the bolt's core
 local CHARGE_AHEAD = 0.7 -- studs in front of the mouth the charge grows
 local CHARGE_DROPLETS = 8
 local CHARGE_CYCLE = 0.55 -- seconds a droplet takes to spiral in and be swallowed
+local CHARGE_HOLD = 0.35 -- seconds the full orb waits at the mouth for the bolt to arrive (network delay)
 local BOLT_DROPLETS = 6
 local SPLASH_DRAG = 3.5 -- 1/s: air drag on the splash droplets...
 local SPLASH_GRAVITY = 60 -- ...and how hard they fall (studs/s²)
@@ -357,61 +359,92 @@ local function randomUnit(): Vector3
 	return if v.Magnitude > 1e-3 then v.Unit else Vector3.yAxis
 end
 
-local function destroyAll(parts: { Instance })
-	for _, part in parts do
-		part:Destroy()
+type Droplet = {
+	Ball: BasePart,
+	Mesh: SpecialMesh,
+	Alpha: number, -- the ball's transparency when fully shown
+	Tail: Beam?,
+	Root: Attachment?, -- the tail runs from the ball's centre...
+	Tip: Attachment?, -- ...back to its point
+	Fade: number, -- last fade applied (to skip rewriting it every frame)
+}
+
+-- A water droplet: a glowing ball and, with `tail`, a Beam behind it that tapers to a point (a
+-- teardrop pointing along its frame's LookVector). The tail's attachments live on `holder`.
+local function newDroplet(body: Color3, tail: Color3?, holder: BasePart, parent: Instance, alpha: number?): Droplet
+	local ball = Instance.new("Part")
+	ball.Anchored = true
+	ball.CanCollide = false
+	ball.CanQuery = false
+	ball.CanTouch = false
+	ball.CastShadow = false
+	ball.Material = Enum.Material.Neon
+	ball.Color = body
+	ball.Transparency = 1 -- shown once placed (fadeDroplet)
+	ball.Size = Vector3.one -- fixed: the mesh's Scale gives the droplet's size in studs
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Sphere
+	mesh.Scale = Vector3.one * 0.05
+	mesh.Parent = ball
+	local droplet: Droplet = { Ball = ball, Mesh = mesh, Alpha = alpha or DROPLET_ALPHA, Fade = 1 }
+	if tail then
+		local root = Instance.new("Attachment")
+		root.Parent = holder
+		local tip = Instance.new("Attachment")
+		tip.Parent = holder
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = root
+		beam.Attachment1 = tip
+		beam.FaceCamera = true
+		beam.Segments = 1
+		beam.Width0 = 0
+		beam.Width1 = 0
+		beam.Color = ColorSequence.new(body, tail)
+		beam.Transparency = NumberSequence.new(1)
+		beam.LightEmission = 1
+		beam.LightInfluence = 0
+		beam.Parent = holder
+		droplet.Tail, droplet.Root, droplet.Tip = beam, root, tip
+	end
+	ball.Parent = parent
+	return droplet
+end
+
+local function destroyDroplet(droplet: Droplet)
+	droplet.Ball:Destroy()
+	local tail, root, tip = droplet.Tail, droplet.Root, droplet.Tip
+	if tail and root and tip then
+		tail:Destroy()
+		root:Destroy()
+		tip:Destroy()
 	end
 end
 
--- One water droplet: a glowing ball with a stretched ellipsoid tail behind it, together a teardrop
--- that points along its frame's LookVector (the way it moves).
-local function newDroplet(body: Color3, tail: Color3, parent: Instance): { BasePart }
-	local parts = {}
-	for i = 1, 2 do
-		local part = Instance.new("Part")
-		part.Anchored = true
-		part.CanCollide = false
-		part.CanQuery = false
-		part.CanTouch = false
-		part.CastShadow = false
-		part.Material = Enum.Material.Neon
-		part.Transparency = 1 -- shown once placed (fadeDroplet)
-		if i == 1 then
-			part.Shape = Enum.PartType.Ball
-			part.Color = body
-		else
-			part.Color = tail
-			local mesh = Instance.new("SpecialMesh")
-			mesh.MeshType = Enum.MeshType.Sphere -- an ellipsoid filling the part's size
-			mesh.Parent = part
-		end
-		part.Size = Vector3.one * 0.1
-		part.Parent = parent
-		parts[i] = part
+-- Shows (0) to hides (1) a droplet.
+local function fadeDroplet(droplet: Droplet, fade: number)
+	if droplet.Fade == fade then
+		return
 	end
-	return parts
-end
-
--- Shows (0) to hides (1) a droplet; `alpha` is its fully-shown transparency (ball, tail).
-local function fadeDroplet(parts: { BasePart }, fade: number, alpha: { number }?)
-	local base = alpha or DROPLET_ALPHA
-	for i, part in parts do
-		part.Transparency = base[i] + (1 - base[i]) * fade
+	droplet.Fade = fade
+	droplet.Ball.Transparency = droplet.Alpha + (1 - droplet.Alpha) * fade
+	if droplet.Tail then
+		droplet.Tail.Transparency = NumberSequence.new(TAIL_ALPHA + (1 - TAIL_ALPHA) * fade, 1)
 	end
 end
 
--- Puts a droplet's ball (diameter `size`) at frame.Position with its tail streaming back from the
--- LookVector; `stretch` 0 is a round drop, 1 a teardrop three times as long as it is wide. Pass
--- `resize` only when the size or stretch changed (resizing costs more than moving).
-local function placeDroplet(parts: { BasePart }, frame: CFrame, size: number, stretch: number, resize: boolean)
+-- Puts a droplet's ball (diameter `size`) at frame.Position, its tail streaming back from the
+-- LookVector: `stretch` 0 is nearly round, 1 a teardrop three times as long as it is wide.
+local function placeDroplet(droplet: Droplet, frame: CFrame, size: number, stretch: number)
 	size = math.max(size, 0.02)
-	local length = size * (1 + 2 * stretch)
-	if resize then
-		parts[1].Size = Vector3.one * size
-		parts[2].Size = Vector3.new(size * 0.82, size * 0.82, length)
+	droplet.Ball.CFrame = frame
+	droplet.Mesh.Scale = Vector3.one * size
+	local tail, root, tip = droplet.Tail, droplet.Root, droplet.Tip
+	if tail and root and tip then
+		local length = size * (1 + 2 * stretch)
+		root.WorldPosition = frame.Position
+		tip.WorldPosition = frame * Vector3.new(0, 0, length - size * 0.32)
+		tail.Width0 = size * 0.82
 	end
-	parts[1].CFrame = frame
-	parts[2].CFrame = frame * CFrame.new(0, 0, length * 0.5 - size * 0.32)
 end
 
 type Ribbon = { A0: Attachment, A1: Attachment, Offset: number }
@@ -445,7 +478,7 @@ end
 
 -------------------------------------------------------------------------------- growing (charge)
 
-type Inflow = { Parts: { BasePart }, Angle: number, Plane: CFrame, Phase: number, Appear: number }
+type Inflow = { Droplet: Droplet, Angle: number, Plane: CFrame, Appear: number }
 
 type Charge = {
 	Mouth: Attachment,
@@ -453,8 +486,8 @@ type Charge = {
 	Duration: number,
 	Unit: number,
 	Holder: BasePart, -- invisible ball at the charge: the mist's sphere; owns everything else
-	Orb: { BasePart },
-	Shell: { BasePart },
+	Orb: Droplet,
+	Shell: Droplet,
 	Light: PointLight,
 	Halo: ParticleEmitter,
 	Intake: ParticleEmitter,
@@ -472,23 +505,23 @@ local function endCharge(charge: Charge)
 	charge.Holder:Destroy()
 end
 
--- Poses a charge for this frame; false once it has run its course (or the fin is gone).
+-- Poses a charge for this frame; false once it has run its course (or the fin is gone). Fully
+-- grown, it holds at the mouth until the bolt arrives (it is ended then, see onEnemyProjectile) or
+-- CHARGE_HOLD runs out.
 local function updateCharge(charge: Charge, now: number): boolean
 	local elapsed = now - charge.Start
-	if elapsed >= charge.Duration or not charge.Mouth.Parent then
+	if elapsed >= charge.Duration + CHARGE_HOLD or not charge.Mouth.Parent then
 		return false
 	end
 	local unit = charge.Unit
-	local progress = elapsed / charge.Duration
+	local progress = math.min(elapsed / charge.Duration, 1)
 	local grow = easeOut(progress)
 	local frame = charge.Mouth.WorldCFrame * CFrame.new(0, 0, -CHARGE_AHEAD)
 	local spun = frame * CFrame.Angles(0, 0, elapsed * 1.6) -- the whole thing turns slowly
 	local size = unit * (0.5 + 1.9 * grow)
 	charge.Holder.CFrame = frame
-	placeDroplet(charge.Orb, frame, size, 0, true)
-	placeDroplet(charge.Shell, frame, size * 1.35, 0, true)
-	fadeDroplet(charge.Orb, 0)
-	fadeDroplet(charge.Shell, 0, SHELL_ALPHA)
+	placeDroplet(charge.Orb, frame, size, 0)
+	placeDroplet(charge.Shell, frame, size * 1.35, 0)
 	charge.Light.Brightness = 1 + 4 * grow
 	charge.Halo.Size = NumberSequence.new(size * 2.6)
 	charge.Intake.Rate = 15 + 55 * progress
@@ -496,21 +529,23 @@ local function updateCharge(charge: Charge, now: number): boolean
 	-- Droplets spiral in from all round, faster as they near the orb, and are swallowed.
 	local outer = unit * (5 - 1.5 * grow)
 	local inner = size * 0.45
-	for _, droplet in charge.Droplets do
-		if progress < droplet.Appear then
-			fadeDroplet(droplet.Parts, 1)
-			continue
+	for _, inflow in charge.Droplets do
+		local since = elapsed - inflow.Appear * charge.Duration
+		if since < 0 then
+			continue -- still hidden
 		end
-		local function at(s: number): Vector3
-			local radius = outer + (inner - outer) * s * s
-			local angle = droplet.Angle + s * 2.6
-			return frame.Position + (spun * droplet.Plane):VectorToWorldSpace(Vector3.new(math.cos(angle), math.sin(angle), 0)) * radius
+		-- Laps start at the rim the moment it appears; each one spirals in and is swallowed.
+		local s = (since / CHARGE_CYCLE) % 1
+		local plane = spun * inflow.Plane
+		local function at(t: number): Vector3
+			local radius = outer + (inner - outer) * t * t
+			local angle = inflow.Angle + t * 2.6
+			return frame.Position + plane:VectorToWorldSpace(Vector3.new(math.cos(angle), math.sin(angle), 0)) * radius
 		end
-		local s = (elapsed / CHARGE_CYCLE + droplet.Phase) % 1
 		local position = at(s)
 		local scale = smooth(s / 0.15) * (1 - smooth((s - 0.75) / 0.25)) -- grows in, shrinks as it is swallowed
-		placeDroplet(droplet.Parts, aim(position, at(math.min(s + 0.02, 1)) - position), unit * 0.55 * scale, 0.3 + 1.2 * s, true)
-		fadeDroplet(droplet.Parts, 0)
+		placeDroplet(inflow.Droplet, aim(position, at(math.min(s + 0.02, 1)) - position), unit * 0.55 * scale, 0.3 + 1.2 * s)
+		fadeDroplet(inflow.Droplet, 0)
 	end
 
 	-- Two streams whirl round it on tilted circles that tighten as it grows.
@@ -567,22 +602,23 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 		Rate = 15,
 	})
 
-	local orb = newDroplet(body, body, holder)
-	local shell = newDroplet(color, color, holder)
+	local orb = newDroplet(body, nil, holder, holder)
+	local shell = newDroplet(color, nil, holder, holder, SHELL_ALPHA)
+	fadeDroplet(orb, 0)
+	fadeDroplet(shell, 0)
 	local glow = Instance.new("PointLight")
 	glow.Color = color
 	glow.Range = 12
 	glow.Brightness = 1
 	glow.Shadows = false
-	glow.Parent = orb[1]
+	glow.Parent = orb.Ball
 
 	local droplets: { Inflow } = {}
 	for i = 1, CHARGE_DROPLETS do
 		table.insert(droplets, {
-			Parts = newDroplet(body, tail, holder),
+			Droplet = newDroplet(body, tail, holder, holder),
 			Angle = i * 2.39996, -- golden angle: spreads them evenly round
 			Plane = CFrame.Angles(math.rad(-50 + 100 * ((i * 0.618) % 1)), math.rad(-40 + 80 * ((i * 0.382) % 1)), 0),
-			Phase = i / CHARGE_DROPLETS,
 			Appear = 0.05 + 0.4 * (i - 1) / (CHARGE_DROPLETS - 1),
 		})
 	end
@@ -615,12 +651,12 @@ end
 
 -------------------------------------------------------------------------------- firing (projectile)
 
-type Orbiter = { Parts: { BasePart }, Offset: number, Size: number, Behind: number }
+type Orbiter = { Droplet: Droplet, Offset: number, Size: number, Behind: number }
 
 type Decor = {
 	Unit: number,
-	Body: { BasePart },
-	Shell: { BasePart },
+	Body: Droplet,
+	Shell: Droplet,
 	Orbiters: { Orbiter },
 	Helix: { Ribbon },
 	Tail: Ribbon,
@@ -710,26 +746,23 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 	-- The head: one big teardrop of water inside a see-through bubble, droplets circling it.
 	local decor: Decor = {
 		Unit = unit,
-		Body = newDroplet(body, tail, bolt),
-		Shell = newDroplet(color, color, bolt),
+		Body = newDroplet(body, tail, bolt, bolt),
+		Shell = newDroplet(color, nil, bolt, bolt, SHELL_ALPHA),
 		Orbiters = {},
 		Helix = {},
 		Tail = newRibbon(bolt, ColorSequence.new(body, edge), 0.38, true, 0),
 		Phase = 0,
 	}
-	placeDroplet(decor.Body, CFrame.identity, unit * 2.2, 0.8, true)
-	placeDroplet(decor.Shell, CFrame.identity, unit * 3, 0.5, true)
 	fadeDroplet(decor.Body, 0)
-	fadeDroplet(decor.Shell, 0, SHELL_ALPHA)
+	fadeDroplet(decor.Shell, 0)
 	for i = 1, BOLT_DROPLETS do
 		local orbiter: Orbiter = {
-			Parts = newDroplet(body, tail, bolt),
+			Droplet = newDroplet(body, tail, bolt, bolt),
 			Offset = i * 2 * math.pi / BOLT_DROPLETS,
 			Size = unit * (0.45 + 0.3 * ((i * 0.618) % 1)),
 			Behind = unit * (0.2 + 1.2 * ((i * 0.382) % 1)),
 		}
-		placeDroplet(orbiter.Parts, CFrame.identity, orbiter.Size, 1.2, true)
-		fadeDroplet(orbiter.Parts, 0)
+		fadeDroplet(orbiter.Droplet, 0)
 		table.insert(decor.Orbiters, orbiter)
 	end
 
@@ -752,8 +785,8 @@ local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
 	local head = bolt.CFrame
 	-- The drop wobbles like liquid: the body and bubble breathe a little.
 	local wobble = 1 + 0.08 * math.sin(decor.Phase * 0.7)
-	placeDroplet(decor.Body, head, unit * 2.2 * wobble, 0.8, true)
-	placeDroplet(decor.Shell, head, unit * 3 / wobble, 0.5, true)
+	placeDroplet(decor.Body, head, unit * 2.2 * wobble, 0.8)
+	placeDroplet(decor.Shell, head, unit * 3 / wobble, 0)
 	for _, orbiter in decor.Orbiters do
 		local angle = decor.Phase * 0.35 + orbiter.Offset
 		local radius = unit * (1.7 + 0.3 * math.sin(decor.Phase * 0.5 + orbiter.Offset * 3))
@@ -761,7 +794,7 @@ local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
 		local tangent = Vector3.new(-math.sin(angle), math.cos(angle), 0)
 		-- Moving with the bolt and round it: pointed mostly forward, leaning into its orbit.
 		local frame = aim(out * radius + Vector3.new(0, 0, orbiter.Behind), -Vector3.zAxis + tangent * 0.35)
-		placeDroplet(orbiter.Parts, head * frame, orbiter.Size, 1.2, false)
+		placeDroplet(orbiter.Droplet, head * frame, orbiter.Size, 1.2)
 	end
 	local behind = Vector3.new(0, 0, unit * 1.2)
 	for _, ribbon in decor.Helix do
@@ -771,7 +804,8 @@ local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
 		ribbon.A0.Position = behind + out * radius
 		ribbon.A1.Position = behind + out * (radius + unit * 0.45)
 	end
-	local sway = Vector3.new(math.sin(decor.Phase * 0.45) * unit * 0.9, 0, unit * 1.5)
+	-- About three waves along its length at the bolt's speed.
+	local sway = Vector3.new(math.sin(decor.Phase * 1.5) * unit * 1.4, 0, unit * 1.5)
 	decor.Tail.A0.Position = sway
 	decor.Tail.A1.Position = sway + Vector3.new(0, unit * 0.5, 0)
 end
@@ -800,7 +834,7 @@ end
 -------------------------------------------------------------------------------- exploding (impact)
 
 type Splash = {
-	Parts: { BasePart },
+	Droplet: Droplet,
 	Origin: Vector3,
 	Velocity: Vector3,
 	Size: number,
@@ -815,7 +849,7 @@ local splashes: { Splash } = {}
 local function updateSplash(splash: Splash, now: number): boolean
 	local t = now - splash.Start
 	if t >= splash.Life then
-		destroyAll(splash.Parts)
+		destroyDroplet(splash.Droplet)
 		return false
 	end
 	local decay = math.exp(-SPLASH_DRAG * t)
@@ -823,8 +857,8 @@ local function updateSplash(splash: Splash, now: number): boolean
 	local velocity = splash.Velocity * decay - Vector3.yAxis * (SPLASH_GRAVITY * t)
 	local life = t / splash.Life
 	local scale = 1 - smooth((life - 0.45) / 0.55)
-	placeDroplet(splash.Parts, aim(position, velocity), splash.Size * scale, math.clamp(velocity.Magnitude / 25, 0.2, 2.2), true)
-	fadeDroplet(splash.Parts, smooth((life - 0.6) / 0.4))
+	placeDroplet(splash.Droplet, aim(position, velocity), splash.Size * scale, math.clamp(velocity.Magnitude / 25, 0.2, 2.2))
+	fadeDroplet(splash.Droplet, if life < 0.6 then 0 else smooth((life - 0.6) / 0.4))
 	return true
 end
 
@@ -889,11 +923,17 @@ local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel
 	local body, tail = waterColors(color, edge)
 	local back = if travel.Magnitude > 1e-3 then -travel.Unit else Vector3.zero
 	local now = os.clock()
+	-- The droplets' tail attachments need a part to live on; it outlasts the longest droplet.
+	local anchor = invisiblePart(Enum.PartType.Block, 0.2)
+	anchor.Transparency = 1
+	anchor.CFrame = CFrame.new(position)
+	anchor.Parent = folder
+	Debris:AddItem(anchor, 1)
 	local function burst(count: number, speed: NumberRange, size: NumberRange, life: NumberRange)
 		for _ = 1, count do
 			local direction = (randomUnit() + back * 0.6 + Vector3.yAxis * 0.4).Unit
 			local splash: Splash = {
-				Parts = newDroplet(body, tail, folder),
+				Droplet = newDroplet(body, tail, anchor, folder),
 				Origin = position,
 				Velocity = direction * (speed.Min + (speed.Max - speed.Min) * math.random()),
 				Size = size.Min + (size.Max - size.Min) * math.random(),
@@ -1069,10 +1109,10 @@ local function endProjectile(id: number, position: Vector3?, reason: string?)
 	local decor = projectile.Decor
 	if decor then
 		-- The drop bursts (the splash below flings its droplets) or vanishes at the end of its range.
-		destroyAll(decor.Body)
-		destroyAll(decor.Shell)
+		destroyDroplet(decor.Body)
+		destroyDroplet(decor.Shell)
 		for _, orbiter in decor.Orbiters do
-			destroyAll(orbiter.Parts)
+			destroyDroplet(orbiter.Droplet)
 		end
 	end
 	-- Let the trail and wake finish instead of vanishing with the orb.
@@ -1143,6 +1183,12 @@ local function onEnemyProjectile(kind: string, id: number, a: any, b: any, c: an
 			radius = StormfinConfig.Bolt.Radius
 		end
 		if style == "StormBolt" or style == "ReflectedStormBolt" then
+			-- The charge that grew this bolt (still held at the mouth, waiting for it) gives way to it.
+			for i = #charges, 1, -1 do
+				if (charges[i].Holder.Position - origin).Magnitude < 4 then
+					endCharge(charges[i])
+				end
+			end
 			local bolt, tail, decor = makeStormBolt(color, edge, radius)
 			bolt.CFrame = CFrame.lookAt(origin, origin + direction)
 			updateBoltDecor(bolt, decor, 0)
