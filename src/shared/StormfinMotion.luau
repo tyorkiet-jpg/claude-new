@@ -81,9 +81,11 @@ local function heading(velocity: Vector3, rest: Vector3): Vector3
 	return unitOr(velocity + rest * 3, rest)
 end
 
--- Nose up while climbing, slightly down while sinking (vertical speed in studs/s).
-local function climbPitch(velocity: Vector3): number
-	return math.clamp(velocity.Y / 25, -0.35, 1.1)
+-- Faces its climb while it rises or sinks while facing along `look`: the pitch of its velocity, as
+-- if it were also cruising forward at 8 studs/s (so a hover's small drift barely tilts it). Capped
+-- short of vertical.
+local function climbPitch(velocity: Vector3, look: Vector3): number
+	return math.clamp(math.atan2(velocity.Y, math.max(velocity:Dot(look), 0) + 8), -0.5, 1.3)
 end
 
 -- Cubic Hermite from p0 (velocity v0) to p1 (velocity v1) over `duration` seconds, at fraction s.
@@ -123,13 +125,12 @@ local function coast(p: Vector3, v: Vector3, t: number): (Vector3, Vector3)
 	return p + v * ((1 - e) / k), v * e
 end
 
--- After a splash-down: drag slows it while buoyancy settles it at `depth` (critically damped).
-local function settle(entry: Vector3, v: Vector3, depth: number, t: number): (Vector3, Vector3)
+-- After a splash-down: drag slows it while buoyancy (`omega`) settles it at `depth` (critically damped).
+local function settle(entry: Vector3, v: Vector3, depth: number, omega: number, t: number): (Vector3, Vector3)
 	local k = Physics.WaterDrag
 	local e = math.exp(-k * t)
 	local h = flat(v)
 	local position = flat(entry) + h * ((1 - e) / k)
-	local omega = Physics.Buoyancy
 	local y0 = entry.Y - depth
 	local c2 = v.Y + y0 * omega
 	local b = math.exp(-omega * t)
@@ -155,7 +156,8 @@ local function ballistic(seg: Segment, t: number): (Vector3, Vector3)
 		return seg.A + v * t + GRAVITY * (0.5 * t * t), v + GRAVITY * t
 	end
 	local p = seg.A + v * entry + GRAVITY * (0.5 * entry * entry)
-	return settle(p, v + GRAVITY * entry, seg.Depth or Config.SwimDepth, t - entry)
+	local buoyancy = if seg.Kind == "Stagger" then Physics.SplashBuoyancy else Physics.Buoyancy
+	return settle(p, v + GRAVITY * entry, seg.Depth or Config.SwimDepth, buoyancy, t - entry)
 end
 
 -- Storm Bolt charge: 0 = neutral, 1 = fully coiled back (nose up), negative = lunging forward.
@@ -227,7 +229,7 @@ function StormfinMotion.Evaluate(seg: Segment, now: number): (Vector3, Vector3, 
 		-- Springs up out of the water, overshoots the hover height a little and settles; noses up
 		-- while it climbs.
 		local position, velocity = spring(b, seg.A - b, v0, Physics.LiftOmega, Physics.LiftDamping, elapsed)
-		return position, pitched(look, climbPitch(velocity)), u
+		return position, pitched(look, climbPitch(velocity, look)), u
 	elseif kind == "Hover" then
 		-- Held on the same spring (it keeps settling from the rise), with a slow figure-eight drift
 		-- eased in, plus the charge coil and shot lunge.
@@ -241,7 +243,7 @@ function StormfinMotion.Evaluate(seg: Segment, now: number): (Vector3, Vector3, 
 			local charge = elapsed - extra.ChargeStart
 			coil = chargeCoil(charge / extra.ChargeTime, charge - extra.ChargeTime)
 		end
-		return position - look * (0.9 * coil), pitched(look, 0.3 * coil + climbPitch(velocity)), u
+		return position - look * (0.9 * coil), pitched(look, 0.3 * coil + climbPitch(velocity, look)), u
 	elseif kind == "Stun" then
 		-- Bobs on the surface (a softer spring) and flounders: thrashes side to side and slaps on
 		-- the water, eased in from the knockback.
@@ -299,6 +301,11 @@ function StormfinMotion.Swim(t: number, a: Vector3, v: Vector3, destination: Vec
 	local delta = flat(b - a)
 	local distance = delta.Magnitude
 	local direction = unitOr(delta, unitOr(flat(v), Vector3.xAxis))
+	-- Bow toward the side it is already drifting to, so it carves the turn instead of stalling.
+	local lateral = v:Dot(direction:Cross(UP))
+	if math.abs(lateral) > 2 then
+		bend = math.abs(bend) * math.sign(lateral)
+	end
 	local bulge = distance * swim.Curve * 0.5 * bend
 	-- Path length of the bowed curve (close enough for timing).
 	local length = distance + (8 / 3) * bulge * bulge / math.max(distance, 1)
@@ -331,17 +338,28 @@ function StormfinMotion.Windup(t: number, a: Vector3, v: Vector3, target: Vector
 	}
 end
 
--- Thunder Breach leap from the launch spot `a` through `aim` under gravity, at Breach.Speed
--- horizontally (slower only for a target so close it would have to rocket straight up, faster for
--- one so far it would have to fly sky-high), then it splashes down past them and glides on underwater.
+-- Thunder Breach leap from the launch spot `a` through `aim` under gravity, at Breach.Speed across
+-- the ground, then it splashes down past them and glides on underwater. Bounded both ways: a
+-- target right on top of it is reached no sooner than MinAimTime, a far one no later than
+-- MaxAimTime (faster across, up to MaxSpeedBoost, beyond which the leap falls short), and a high
+-- one (a jumping player) gets a longer leap that peaks at most MaxRise above the aim point.
 function StormfinMotion.Leap(t: number, a: Vector3, aim: Vector3, fallback: Vector3): Segment
 	local settings = Config.Breach
+	local g = Physics.Gravity
 	local toAim = flat(aim - a)
 	local direction = unitOr(toAim, fallback)
 	local distance = math.max(toAim.Magnitude, 4)
+	local height = aim.Y - a.Y
 	local time = math.clamp(distance / settings.Speed, settings.MinAimTime, settings.MaxAimTime)
-	local climb = (aim.Y - a.Y + 0.5 * Physics.Gravity * time * time) / time
-	local segment: Segment = { Kind = "Leap", Start = t, Duration = 0, A = a, V = direction * (distance / time) + UP * climb, Depth = Config.SwimDepth }
+	-- Earliest arrival that keeps the apex within MaxRise of the aim point.
+	local maxClimb = math.sqrt(2 * g * math.max(height + settings.MaxRise, 0))
+	local disc = maxClimb * maxClimb - 2 * g * height
+	if disc >= 0 then
+		time = math.max(time, (maxClimb - math.sqrt(disc)) / g)
+	end
+	local climb = (height + 0.5 * g * time * time) / time
+	local across = math.min(distance / time, settings.Speed * settings.MaxSpeedBoost)
+	local segment: Segment = { Kind = "Leap", Start = t, Duration = 0, A = a, V = direction * across + UP * climb, Depth = Config.SwimDepth }
 	segment.Duration = StormfinMotion.EntryTime(segment) + Physics.Glide
 	return segment
 end

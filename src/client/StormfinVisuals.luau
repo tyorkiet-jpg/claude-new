@@ -32,7 +32,7 @@ local UP = Vector3.yAxis
 local WHITE = Color3.new(1, 1, 1)
 local SPINE_SPACING = Config.BodyLength / 6
 local MAX_JOINT_BEND = 0.45 -- radians between neighbouring spine segments: curls like a fish, never folds
-local TURN_BLEND = 0.22 -- seconds to swing from the old facing into a new segment's (no snapping)
+local MAX_TURN_RATE = 12 -- radians/s the drawn body can turn: a sudden change of heading becomes a quick turn, never a snap
 -- Swimming wave: it travels back along the body WAVE_STEP radians per spine point. Real eels push
 -- the wave back a little faster than they swim (slip ~0.8); beating slower than that looks like
 -- sliding through the water, so the beat is locked to forward speed: BEAT_PER_STUD radians per stud.
@@ -44,8 +44,8 @@ local COAST_BEAT = 2.5 -- no thrust (airborne, or gliding after a splash): the t
 local THRASH_BEAT = 14 -- floundering on the surface
 local BANK_ACCEL = 60 -- studs/s² of sideways (turning) acceleration that banks it 45 degrees
 local MAX_BANK = 0.6 -- radians
-local CORRECTION_TIME = 0.15 -- seconds to ease out the small jump when a segment arrives late
-local MAX_CORRECTION = 8 -- studs; bigger jumps (a resync) snap
+local CORRECTION_TIME = 0.15 -- seconds to ease out the jump when a segment arrives late
+local MAX_CORRECTION = 8 -- studs (plus a quarter of the new segment's starting speed); bigger jumps (a resync) snap
 local FLINCH_TIME = 0.22 -- hit reaction length
 local SHAKE_RANGE = 30 -- studs: a breach this close to you shakes the camera
 -- Spine segment sizes, head first: a sleek taper from a broad chest to a thin tail stalk. Each is
@@ -83,9 +83,8 @@ type View = {
 	Previous: Motion.Segment?,
 	LastY: number?,
 	Forward: Vector3?, -- facing drawn last frame
-	BlendFrom: Vector3?, -- facing when the current segment began
-	BlendStart: number,
-	Drawn: Vector3?, -- body centre drawn last frame
+	Drawn: Vector3?, -- body centre drawn last frame...
+	DrawnTime: number, -- ...and the server time it was drawn for
 	Correction: Vector3, -- offset eased out after a late segment
 	CorrectionStart: number,
 	Accel: Vector3, -- smoothed acceleration (studs/s²)
@@ -258,9 +257,8 @@ local function newView(id: number, serverModel: Model?, model: Model, effects: E
 		Previous = nil,
 		LastY = nil,
 		Forward = nil,
-		BlendFrom = nil,
-		BlendStart = 0,
 		Drawn = nil,
+		DrawnTime = 0,
 		Correction = Vector3.zero,
 		CorrectionStart = 0,
 		Accel = Vector3.zero,
@@ -429,13 +427,12 @@ end
 local function onSegment(view: View, segment: Motion.Segment)
 	view.Previous = view.Segment
 	view.Segment = segment
-	view.BlendFrom = view.Forward
-	view.BlendStart = os.clock()
-	-- The segment reaches us a little after it started; ease out the gap between where we drew the
-	-- fish (still on the old segment) and where the new one says it is now.
+	-- The segment reaches us a little after it started; ease out the gap between where we last drew
+	-- the fish (still on the old segment) and where the new one puts it at that same moment.
 	if view.Drawn then
-		local gap = view.Drawn - Motion.Evaluate(segment, serverNow())
-		view.Correction = if gap.Magnitude < MAX_CORRECTION then gap else Vector3.zero
+		local gap = view.Drawn - Motion.Evaluate(segment, view.DrawnTime)
+		local limit = MAX_CORRECTION + (segment.V or Vector3.zero).Magnitude * 0.25
+		view.Correction = if gap.Magnitude < limit then gap else Vector3.zero
 		view.CorrectionStart = os.clock()
 	end
 	local kind = segment.Kind
@@ -566,21 +563,26 @@ local function update(dt: number)
 			centre += view.Correction * (1 - smooth(fade))
 		end
 		view.Drawn = centre
-		-- Each segment starts with its own facing; swing into it from the old one instead of snapping.
-		local blend = (clock - view.BlendStart) / TURN_BLEND
-		if view.BlendFrom and blend < 1 then
-			forward = Motion.TurnToward(view.BlendFrom, forward, smooth(blend))
+		view.DrawnTime = t
+		-- The body turns at a limited rate toward the motion's facing, so a sudden change of heading
+		-- (a new segment, a swim reversing its momentum) reads as a quick turn instead of a snap.
+		if view.Forward then
+			local angle = math.acos(math.clamp(view.Forward:Dot(forward), -1, 1))
+			local step = MAX_TURN_RATE * dt
+			if angle > step then
+				forward = Motion.TurnToward(view.Forward, forward, step / angle)
+			end
 		end
 		view.Forward = forward
 		local kind = segment.Kind
 		-- What it is actually doing, from the motion itself (not frame-to-frame differences).
 		local velocity = Motion.Velocity(segment, t)
-		local accel = (velocity - Motion.Velocity(segment, t - 1 / 30)) * 30
-		view.Accel += (accel - view.Accel) * math.min(dt * 10, 1)
+		local accel = (velocity - Motion.Velocity(segment, t - 1 / 120)) * 120
+		view.Accel += (accel - view.Accel) * math.min(dt * 30, 1)
 		local speed = velocity.Magnitude
 		local moving = speed > 4
 		local hovering = kind == "Hover" or kind == "Rise" or kind == "Stun"
-		local powered = kind == "Swim" or kind == "Windup" or kind == "Rise" or kind == "Hover"
+		local powered = kind == "Swim" or kind == "Rise" or kind == "Hover" -- swimming under its own power
 		local submerged = centre.Y < Config.SubmergedBelow
 
 		-- Splash when it crosses the surface either way (a dead one falling in too).
@@ -620,21 +622,24 @@ local function update(dt: number)
 		end
 
 		-- Undulation: a wave travelling back along the body, strongest at the tail.
-		-- Powered (swimming, rising, hovering): the beat is locked to forward speed, and it strokes
-		-- harder while accelerating. Floundering: a fast thrash. Otherwise (airborne, or gliding after
+		-- Powered (swimming, rising, hovering): the beat is locked to its speed along its path, and it
+		-- strokes harder while accelerating. Floundering: a fast thrash. Otherwise (airborne, or gliding after
 		-- a splash) there's no thrust: a slow, small trailing sway.
 		local side = forward:Cross(UP)
 		side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
-		local forwardSpeed = math.max(velocity:Dot(forward), 0)
-		local thrust = math.clamp(view.Accel:Dot(forward) / 40, 0, 1)
+		local travel = if speed > 1e-3 then velocity / speed else forward
+		local thrust = math.clamp(view.Accel:Dot(travel) / 40, 0, 1) -- speeding up along its path
 		local beat, amplitude
 		if view.Dead then
 			beat, amplitude = 0, 0
 		elseif kind == "Stun" then
 			beat, amplitude = THRASH_BEAT, 0.5
+		elseif kind == "Windup" then
+			-- Braking and coiling: no stroke, the tension shows in the tremble below.
+			beat, amplitude = IDLE_BEAT, 0.16
 		elseif powered then
-			beat = math.max(IDLE_BEAT, forwardSpeed * BEAT_PER_STUD) * (1 + 0.4 * thrust)
-			amplitude = 0.16 + 0.3 * math.clamp(forwardSpeed / Config.Swim.Speed, 0, 1.3) + 0.2 * thrust
+			beat = math.max(IDLE_BEAT, speed * BEAT_PER_STUD) * (1 + 0.4 * thrust)
+			amplitude = 0.16 + 0.3 * math.clamp(speed / Config.Swim.Speed, 0, 1.3) + 0.2 * thrust
 		else
 			beat, amplitude = COAST_BEAT, 0.12
 		end
@@ -648,17 +653,10 @@ local function update(dt: number)
 		if clock < view.FlinchUntil then
 			flinch = math.sin(math.pi * math.sqrt(1 - (view.FlinchUntil - clock) / FLINCH_TIME))
 		end
-		local drawn = {}
-		for i, point in points do
-			local along = (i - 1) / (#points - 1)
-			local wave = math.sin(view.Phase - i * WAVE_STEP) * view.Amplitude * along ^ 1.3
-			local shiver = math.sin(clock * 55 + i * 1.7) * 0.09 * tremble * (0.4 + 0.6 * along)
-			drawn[i] = point + side * (wave + shiver) + UP * flinch * 0.5 * (1 - i / #points)
-		end
-		-- Roll about the body axis: banks into turns while it swims or flies under its own power,
-		-- rocks onto its sides while floundering, belly-up when it dies.
+		-- Roll about the body axis: banks into turns while it swims, rocks onto its sides while
+		-- floundering, belly-up when it dies.
 		local targetRoll = 0
-		if powered and moving then
+		if kind == "Swim" and moving then
 			-- Turning right (accelerating toward its right) dips the right side.
 			targetRoll = -math.clamp(math.atan(view.Accel:Dot(side) / BANK_ACCEL), -MAX_BANK, MAX_BANK)
 		elseif kind == "Stun" then
@@ -668,6 +666,16 @@ local function update(dt: number)
 		end
 		view.Roll += (targetRoll - view.Roll) * math.min(dt * 12, 1)
 		local roll = CFrame.Angles(0, 0, view.Roll)
+		-- The wave runs side to side relative to the (rolled) body. CFrame.Angles(0, 0, r) turns about
+		-- the body's +Z axis, which points backward.
+		local bodySide = CFrame.fromAxisAngle(-forward, view.Roll):VectorToWorldSpace(side)
+		local drawn = {}
+		for i, point in points do
+			local along = (i - 1) / (#points - 1)
+			local wave = math.sin(view.Phase - i * WAVE_STEP) * view.Amplitude * along ^ 1.3
+			local shiver = math.sin(clock * 55 + i * 1.7) * 0.09 * tremble * (0.4 + 0.6 * along)
+			drawn[i] = point + bodySide * (wave + shiver) + UP * flinch * 0.5 * (1 - i / #points)
+		end
 		if view.Mesh then
 			poseMesh(view, drawn, roll)
 		else
@@ -697,7 +705,7 @@ local function update(dt: number)
 			local back = view.Spine[3].CFrame
 			fins.Dorsal.CFrame = back * CFrame.new(0, 1.2, 0.3) * CFrame.Angles(-0.5, 0, 0)
 			local tail = view.Spine[#view.Spine].CFrame
-			local tailSwing = math.sin(view.Phase - #points * 0.9) * 0.3 * speedFactor
+			local tailSwing = math.sin(view.Phase - #points * WAVE_STEP) * 0.8 * view.Amplitude
 			fins.TailUpper.CFrame = tail * CFrame.new(0, 0, 0.6) * CFrame.Angles(-0.75, tailSwing, 0) * CFrame.new(0, 1.0, 0.2)
 			fins.TailLower.CFrame = tail * CFrame.new(0, 0, 0.6) * CFrame.Angles(0.75, tailSwing, 0) * CFrame.new(0, -1.0, 0.2)
 		end

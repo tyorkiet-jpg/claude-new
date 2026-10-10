@@ -430,6 +430,10 @@ local function die(fin: Fin)
 	fin.Alive = false
 	fin.Interrupted = true
 	local t, position, forward, velocity = state(fin)
+	local kind = fin.Segment.Kind
+	if kind == "Swim" or kind == "Windup" or kind == "Rise" or kind == "Hover" then
+		velocity *= 0.4 -- its own thrust dies with it; only some of that speed carries on
+	end
 	local death = Motion.Death(t, position, forward, velocity)
 	local duration = death.Duration
 	setSegment(fin, death, true)
