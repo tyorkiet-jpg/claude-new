@@ -384,7 +384,9 @@ function StormfinMotion.Rise(t: number, a: Vector3, v: Vector3, hoverPoint: Vect
 end
 
 function StormfinMotion.Hover(t: number, a: Vector3, v: Vector3, hoverPoint: Vector3, look: Vector3, extra: { [string]: any }): Segment
-	return { Kind = "Hover", Start = t, Duration = Config.Bolt.HoverTime, A = a, B = hoverPoint, V = v, Look = look, Extra = extra }
+	local bolt = Config.Bolt
+	local duration = bolt.ChargeStart + bolt.ChargeTime + bolt.AfterFire -- dives as soon as the shot is away
+	return { Kind = "Hover", Start = t, Duration = duration, A = a, B = hoverPoint, V = v, Look = look, Extra = extra }
 end
 
 -- Tips over and drops back into the water: keeps its momentum plus a small kick forward and up.
