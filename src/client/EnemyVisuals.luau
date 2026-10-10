@@ -49,8 +49,9 @@ type Projectile = {
 	Range: number,
 	Start: number,
 	Style: string?,
-	Aligned: { [ParticleEmitter]: number }?, -- Storm Bolt streaks kept pointing along the flight
+	Edge: Color3?, -- Storm Bolt: deep outer colour
 	Tail: Attachment?, -- Storm Bolt wake end, trailing behind the head
+	Decor: Decor?, -- Storm Bolt crystals and ribbons, moved every frame
 }
 
 local projectiles: { [number]: Projectile } = {}
@@ -313,50 +314,310 @@ local function makeIntake(color: Color3): BasePart
 	return intake
 end
 
--- Storm Bolt (Stormfin): a lightning arrow. A white-hot head, a wake that widens and fades behind
--- it (two tapered Beams from the head back along the flight: white core, coloured glow), a bow
--- wave of thin streaks flaring back off the head and long faint dashes streaming past. The part
--- is an invisible box around the flight line: its volume seeds the dashes; the Center attachment
--- is the head. A parried bolt is reflected as the same arrow in the player's attack colour
--- (style "ReflectedStormBolt").
--- The streaks are camera-facing and re-rotated every frame to lie along the bolt's on-screen
--- direction (alignStreaks). VelocityParallel can't be used: it only lines a texture up with
--- vertical motion and stands it across horizontal motion. Squash > 0 makes them longer/thinner.
-local BOLT_EDGE = Color3.fromRGB(70, 140, 255) -- outer glow of the Stormfin's own bolt
-local BOLT_LENGTH = 14 -- studs of wake behind the head
+-- Storm Bolt (Stormfin), after the user's "IceBall Magic" reference: a charged ball of storm-ice.
+-- GROWING (EnemyVisuals.ChargeStormBolt, at the fin's mouth while it charges): a white-hot orb
+-- swells, crystals sprout from it one by one, two energy streams whirl round it and sparkles are
+-- drawn in. FIRING (makeStormBolt): a cluster of crystal spikes splaying back from a white-hot
+-- core, ribbons twisting round its wake, a soft comet glow and a trail of sparkles. EXPLODING
+-- (stormBurst): a flash, shockwave rings, needle rays, sparkles and crystal shards flung outward.
+-- A parried bolt comes back as the same thing in the player's attack colour ("ReflectedStormBolt").
+-- There are no crystal textures, so the crystals are real parts (crossed neon blades, see
+-- newCrystal) and read as solid ice from any angle; the ribbons are Trails on attachments that
+-- orbit the flight line every frame; the explosion's rays are thin crystals too, because
+-- VelocityParallel particles stand across horizontal motion.
+local BOLT_EDGE = Color3.fromRGB(70, 140, 255) -- deep blue edge of the Stormfin's own bolt
+local BOLT_LENGTH = 9 -- studs of comet glow behind the head
 local BOLT_SCALE = 0.55 -- overall size of the effect relative to the hit radius (user: it was too large)
+local CRYSTAL_THICKNESS = 0.05 -- studs; each crystal blade is this thin
+local CRYSTAL_ALPHA = { 0.05, 0.05, 0.3, 0.3 } -- the light blade nearly solid, the dark one see-through
+local CHARGE_AHEAD = 0.7 -- studs in front of the mouth the charge grows
+local CHARGE_CRYSTALS = 7
+local SHARD_DRAG = 5 -- 1/s: how fast the explosion's shards slow down
 
-local END_ON = 0.35 -- below this much sideways view the streaks are switched off (see alignStreaks)
+local function smooth(x: number): number
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
 
--- Points each streak emitter along the bolt as the camera sees it at the head's position (with
--- perspective, so it holds when the bolt passes close by); `spread` fans it by up to that many
--- degrees. Camera-facing streaks can't foreshorten, so when the bolt is seen nearly end-on
--- (flying at you) they'd stand up as long lines: they stop emitting and the head and its arcs
--- carry the look.
-local function alignStreaks(aligned: { [ParticleEmitter]: number }, head: Vector3, direction: Vector3)
-	local camera = workspace.CurrentCamera
-	local ray = head - camera.CFrame.Position
-	local sideways = if ray.Magnitude > 0.01 then direction:Cross(ray.Unit).Magnitude else 0
-	local a = camera:WorldToViewportPoint(head)
-	local b = camera:WorldToViewportPoint(head - direction * 2)
-	local angle
-	if a.Z > 0 and b.Z > 0 then
-		-- Particle Rotation turns counterclockwise on screen; viewport Y grows downward.
-		angle = -math.deg(math.atan2(a.X - b.X, b.Y - a.Y))
-	else
-		local view = camera.CFrame
-		angle = -math.deg(math.atan2(view.RightVector:Dot(direction), view.UpVector:Dot(direction)))
+-- CFrame at `position` looking along `direction` (straight up or down included).
+local function aim(position: Vector3, direction: Vector3): CFrame
+	if direction.Magnitude < 1e-4 then
+		return CFrame.new(position)
 	end
-	for emitter, spread in aligned do
-		emitter.Enabled = sideways >= END_ON
-		emitter.Rotation = NumberRange.new(angle - spread, angle + spread)
+	local up = if math.abs(direction.Unit.Y) > 0.98 then Vector3.xAxis else Vector3.yAxis
+	return CFrame.lookAt(position, position + direction, up)
+end
+
+local function randomUnit(): Vector3
+	local v = Vector3.new(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1)
+	return if v.Magnitude > 1e-3 then v.Unit else Vector3.yAxis
+end
+
+type Crystal = {
+	Parts: { BasePart },
+	Frame: CFrame, -- (bolt) base and pointing direction, relative to the head
+	Direction: Vector3, -- (charge) pointing direction, relative to the mouth
+	Length: number,
+	Width: number,
+	Appear: number, -- (charge) charge progress at which it starts to sprout
+}
+
+-- One ice crystal: two crossed blades, each an isosceles triangle of two mirrored wedges. A
+-- WedgePart is thin along its front-bottom edge, so a wedge and a copy turned upside down beneath
+-- it meet in a point at the front: the crystal points along its frame's LookVector (-Z).
+local function newCrystal(light: Color3, dark: Color3, parent: Instance): { BasePart }
+	local parts = {}
+	for i = 1, 4 do
+		local wedge = Instance.new("WedgePart")
+		wedge.Anchored = true
+		wedge.CanCollide = false
+		wedge.CanQuery = false
+		wedge.CanTouch = false
+		wedge.CastShadow = false
+		wedge.Material = Enum.Material.Neon
+		wedge.Color = if i <= 2 then light else dark
+		wedge.Transparency = 1 -- shown once placed (fadeCrystal)
+		wedge.Size = Vector3.new(CRYSTAL_THICKNESS, 0.1, 0.1)
+		wedge.Parent = parent
+		parts[i] = wedge
+	end
+	return parts
+end
+
+-- Shows (0) to hides (1) a crystal.
+local function fadeCrystal(parts: { BasePart }, fade: number)
+	for i, part in parts do
+		part.Transparency = CRYSTAL_ALPHA[i] + (1 - CRYSTAL_ALPHA[i]) * fade
 	end
 end
 
-local function makeStormBolt(color: Color3, edge: Color3, radius: number): (BasePart, { [ParticleEmitter]: number }, Attachment)
-	radius *= BOLT_SCALE -- every size below is relative to this
-	local bolt = invisiblePart(Enum.PartType.Block, 1)
-	bolt.Size = Vector3.new(radius * 8, radius * 8, radius * 2)
+-- Puts a crystal's base at frame.Position, pointing along frame.LookVector. `resize` only when the
+-- length or width changed (resizing costs more than moving).
+local function placeCrystal(parts: { BasePart }, frame: CFrame, length: number, width: number, resize: boolean)
+	length = math.max(length, 0.02)
+	local half = math.max(width, 0.02) * 0.5
+	local centre = frame * CFrame.new(0, 0, -length * 0.5)
+	for blade = 0, 1 do
+		local bladeFrame = centre * CFrame.Angles(0, 0, blade * math.pi * 0.5)
+		local upper, lower = parts[blade * 2 + 1], parts[blade * 2 + 2]
+		if resize then
+			local size = Vector3.new(CRYSTAL_THICKNESS, half, length)
+			upper.Size = size
+			lower.Size = size
+		end
+		upper.CFrame = bladeFrame * CFrame.new(0, half * 0.5, 0)
+		lower.CFrame = bladeFrame * CFrame.new(0, -half * 0.5, 0) * CFrame.Angles(0, 0, math.pi)
+	end
+end
+
+local function destroyAll(parts: { Instance })
+	for _, part in parts do
+		part:Destroy()
+	end
+end
+
+type Ribbon = { A0: Attachment, A1: Attachment, Offset: number }
+
+-- A ribbon of light: a Trail between two attachments that the caller moves every frame (their
+-- separation is its width). FaceCamera off keeps a twisting band's real 3D twist.
+local function newRibbon(parent: Instance, colors: ColorSequence, lifetime: number, faceCamera: boolean, offset: number): Ribbon
+	local a0 = Instance.new("Attachment")
+	a0.Parent = parent
+	local a1 = Instance.new("Attachment")
+	a1.Parent = parent
+	local trail = Instance.new("Trail")
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.FaceCamera = faceCamera
+	trail.Lifetime = lifetime
+	trail.MinLength = 0
+	trail.Color = colors
+	trail.Transparency = Seq({ { 0, 0.05 }, { 0.5, 0.4 }, { 1, 1 } })
+	trail.WidthScale = Seq({ { 0, 1 }, { 1, 0.3 } })
+	trail.LightEmission = 1
+	trail.LightInfluence = 0
+	trail.Parent = parent
+	return { A0 = a0, A1 = a1, Offset = offset }
+end
+
+-------------------------------------------------------------------------------- growing (charge)
+
+type Charge = {
+	Mouth: Attachment,
+	Start: number,
+	Duration: number,
+	Unit: number,
+	Holder: BasePart, -- invisible ball at the charge: the intake sparkles' sphere; owns everything else
+	Orb: BasePart,
+	Light: PointLight,
+	Halo: ParticleEmitter,
+	Intake: ParticleEmitter,
+	Crystals: { Crystal },
+	Ribbons: { Ribbon },
+}
+
+local charges: { Charge } = {}
+
+local function endCharge(charge: Charge)
+	local index = table.find(charges, charge)
+	if index then
+		table.remove(charges, index)
+	end
+	charge.Holder:Destroy()
+end
+
+-- Poses a charge for this frame; false once it has run its course (or the fin is gone).
+local function updateCharge(charge: Charge, now: number): boolean
+	local elapsed = now - charge.Start
+	if elapsed >= charge.Duration or not charge.Mouth.Parent then
+		return false
+	end
+	local unit = charge.Unit
+	local progress = elapsed / charge.Duration
+	local grow = easeOut(progress)
+	local frame = charge.Mouth.WorldCFrame * CFrame.new(0, 0, -CHARGE_AHEAD)
+	local spun = frame * CFrame.Angles(0, 0, elapsed * 1.6) -- the whole cluster turns slowly
+	local size = unit * (0.5 + 1.9 * grow)
+	charge.Holder.CFrame = frame
+	charge.Orb.Size = Vector3.one * size
+	charge.Orb.CFrame = frame
+	charge.Light.Brightness = 1 + 4 * grow
+	charge.Halo.Size = NumberSequence.new(size * 2.6)
+	charge.Intake.Rate = 15 + 55 * progress
+
+	-- Crystals sprout one after another and grow out of the orb.
+	for _, crystal in charge.Crystals do
+		local sprout = easeOut((progress - crystal.Appear) / 0.3)
+		if sprout <= 0 then
+			fadeCrystal(crystal.Parts, 1)
+		else
+			local direction = spun:VectorToWorldSpace(crystal.Direction)
+			fadeCrystal(crystal.Parts, 0)
+			placeCrystal(crystal.Parts, aim(frame.Position + direction * size * 0.3, direction), crystal.Length * sprout, crystal.Width * sprout, true)
+		end
+	end
+
+	-- Two streams whirl round it on tilted circles that tighten as it grows.
+	local radius = unit * (3.2 - 1.2 * grow)
+	local band = unit * (0.25 + 0.3 * grow)
+	for i, ribbon in charge.Ribbons do
+		local plane = spun * CFrame.Angles(if i == 1 then 0.9 else -0.9, 0.5, 0)
+		local angle = elapsed * 13 + ribbon.Offset
+		local out = plane:VectorToWorldSpace(Vector3.new(math.cos(angle), math.sin(angle), 0))
+		ribbon.A0.WorldPosition = frame.Position + out * radius
+		ribbon.A1.WorldPosition = frame.Position + out * (radius + band)
+	end
+	return true
+end
+
+-- GROWING: the Storm Bolt swells at `mouth` (an Attachment whose LookVector is the fin's facing)
+-- for `duration` seconds and is gone when the bolt fires. Returns a function that cancels it.
+function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -> ()
+	local folder = fxFolder()
+	if not folder or duration <= 0 then
+		return function() end
+	end
+	local color = StormfinConfig.Visuals.BoltColor
+	local light, dark = WHITE:Lerp(color, 0.35), BOLT_EDGE:Lerp(color, 0.3)
+	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
+
+	local holder = invisiblePart(Enum.PartType.Ball, unit * 7)
+	holder.Transparency = 1
+	holder.CFrame = mouth.WorldCFrame
+	local centre = Instance.new("Attachment")
+	centre.Parent = holder
+	local halo = VFXUtil.Emitter(centre, {
+		Texture = Tex.Glow,
+		Color = ColorSequence.new(color),
+		LightEmission = 0.6,
+		Size = NumberSequence.new(unit),
+		Transparency = Seq({ { 0, 0.5 }, { 0.5, 0.3 }, { 1, 1 } }),
+		Lifetime = NumberRange.new(0.15),
+		Speed = NumberRange.new(0),
+		LockedToPart = true,
+		Rate = 30,
+	})
+	local intake = VFXUtil.Emitter(holder, { -- sparkles drawn in from all round
+		Texture = Tex.Glow,
+		Color = VFXUtil.Hot(color, WHITE),
+		LightEmission = 1,
+		Shape = Enum.ParticleEmitterShape.Sphere,
+		ShapeInOut = Enum.ParticleEmitterShapeInOut.Inward,
+		ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface,
+		Size = Seq({ { 0, 0 }, { 0.3, unit * 0.35 }, { 1, unit * 0.1 } }),
+		Transparency = Seq({ { 0, 1 }, { 0.3, 0.1 }, { 1, 0 } }),
+		Lifetime = NumberRange.new(0.25, 0.35),
+		Speed = NumberRange.new(unit * 9),
+		Rate = 15,
+	})
+
+	local orb = invisiblePart(Enum.PartType.Ball, unit)
+	orb.Material = Enum.Material.Neon
+	orb.Color = WHITE:Lerp(color, 0.3)
+	orb.Parent = holder
+	local glow = Instance.new("PointLight")
+	glow.Color = color
+	glow.Range = 12
+	glow.Brightness = 1
+	glow.Shadows = false
+	glow.Parent = orb
+
+	-- Crystals spread round the front half (never back into the fin's head), sprouting in turn.
+	local crystals: { Crystal } = {}
+	for i = 1, CHARGE_CRYSTALS do
+		local azimuth = i * 2.39996 -- golden angle: spreads them evenly round
+		local tilt = math.rad(40 + 50 * ((i * 0.618) % 1)) -- from straight ahead out to the sides
+		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), -math.cos(tilt))
+		local length = unit * (1.6 + 1.2 * ((i * 0.382) % 1))
+		table.insert(crystals, {
+			Parts = newCrystal(light, dark, holder),
+			Frame = CFrame.identity,
+			Direction = direction,
+			Length = length,
+			Width = length * 0.42,
+			Appear = 0.08 + 0.55 * (i - 1) / (CHARGE_CRYSTALS - 1),
+		})
+	end
+	local ribbons = {
+		newRibbon(holder, ColorSequence.new(WHITE, color), 0.16, true, 0),
+		newRibbon(holder, ColorSequence.new(WHITE, color), 0.16, true, math.pi),
+	}
+
+	holder.Parent = folder
+	local charge: Charge = {
+		Mouth = mouth,
+		Start = os.clock(),
+		Duration = duration,
+		Unit = unit,
+		Holder = holder,
+		Orb = orb,
+		Light = glow,
+		Halo = halo,
+		Intake = intake,
+		Crystals = crystals,
+		Ribbons = ribbons,
+	}
+	table.insert(charges, charge)
+	updateCharge(charge, charge.Start)
+	return function()
+		endCharge(charge)
+	end
+end
+
+-------------------------------------------------------------------------------- firing (projectile)
+
+type Decor = {
+	Unit: number,
+	Crystals: { Crystal },
+	Helix: { Ribbon },
+	Tail: Ribbon,
+	Spin: number,
+	Phase: number,
+}
+
+local function makeStormBolt(color: Color3, edge: Color3, radius: number): (BasePart, Attachment, Decor)
+	local unit = radius * BOLT_SCALE -- every size below is relative to this
+	local bolt = invisiblePart(Enum.PartType.Block, unit * 3)
 	bolt.Transparency = 1
 	local light = Instance.new("PointLight")
 	light.Color = color
@@ -368,15 +629,11 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 	tip.Name = "Center"
 	tip.Parent = bolt
 	local hot = VFXUtil.Hot(WHITE, color)
-	local back = Enum.NormalId.Back -- the part looks along the flight, so Back is behind the tip
-	local aligned: { [ParticleEmitter]: number } = {}
 
-	-- Head: camera-facing, so the bolt still reads when it flies straight at you (the wake and
-	-- streaks below all lie along the flight and collapse to nothing when seen head-on).
 	VFXUtil.Emitter(tip, { -- white-hot core
 		Texture = Tex.Glow,
 		Color = ColorSequence.new(WHITE, WHITE:Lerp(color, 0.5)),
-		Size = NumberSequence.new(radius * 1.8),
+		Size = NumberSequence.new(unit * 2.2),
 		Transparency = Seq({ { 0, 0 }, { 1, 0.5 } }),
 		Lifetime = NumberRange.new(0.08),
 		Speed = NumberRange.new(0),
@@ -384,37 +641,20 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 		ZOffset = 1,
 		Rate = 40,
 	})
-	VFXUtil.Emitter(tip, { -- spiky star around the core
-		Texture = Tex.Flare,
-		Color = hot,
-		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, radius * 3.5, radius), NumberSequenceKeypoint.new(1, radius * 2) }),
-		Transparency = Seq({ { 0, 0.1 }, { 1, 1 } }),
-		Lifetime = NumberRange.new(0.06, 0.1),
+	VFXUtil.Emitter(tip, { -- coloured halo round the crystals
+		Texture = Tex.Glow,
+		Color = ColorSequence.new(color, edge),
+		LightEmission = 0.6,
+		Size = NumberSequence.new(unit * 5.5),
+		Transparency = Seq({ { 0, 0.55 }, { 1, 1 } }),
+		Lifetime = NumberRange.new(0.12),
 		Speed = NumberRange.new(0),
-		Rotation = NumberRange.new(0, 360),
 		LockedToPart = true,
-		ZOffset = 1,
 		Rate = 30,
 	})
-	VFXUtil.Emitter(tip, { -- arcs crackling over the head
-		Texture = Tex.Arc,
-		Color = hot,
-		FlipbookLayout = Enum.ParticleFlipbookLayout.Grid2x2,
-		FlipbookMode = Enum.ParticleFlipbookMode.Loop,
-		FlipbookFramerate = NumberRange.new(30),
-		FlipbookStartRandom = true,
-		Size = NumberSequence.new(radius * 3),
-		Transparency = Seq({ { 0, 0 }, { 1, 1 } }),
-		Lifetime = NumberRange.new(0.06, 0.12),
-		Speed = NumberRange.new(0),
-		Rotation = NumberRange.new(0, 360),
-		LockedToPart = true,
-		Rate = 20,
-	})
 
-	-- Wake: Beams from the head to a tail attachment that trails BOLT_LENGTH behind (moved each
-	-- frame, see the RenderStepped loop), pointed at the head and widening back like the
-	-- reference's beam. The texture scrolls toward the tail so the beam streams.
+	-- Comet glow: Beams from the head to a tail attachment that trails BOLT_LENGTH behind (moved
+	-- each frame, see Init), widening back. The texture scrolls toward the tail so it streams.
 	local tail = Instance.new("Attachment")
 	tail.Name = "Tail"
 	tail.Parent = bolt
@@ -436,65 +676,233 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 		b.LightInfluence = 0
 		b.Parent = bolt
 	end
-	beam(radius * 2, radius * 13, ColorSequence.new(color, edge), Seq({ { 0, 0.1 }, { 0.5, 0.45 }, { 1, 1 } }), -1.5) -- glow
-	beam(radius, radius * 7, ColorSequence.new({
-		ColorSequenceKeypoint.new(0, WHITE),
-		ColorSequenceKeypoint.new(0.5, WHITE:Lerp(color, 0.4)),
-		ColorSequenceKeypoint.new(1, color),
-	}), Seq({ { 0, 0 }, { 0.6, 0.35 }, { 1, 1 } }), -2.5) -- core
-	aligned[VFXUtil.Emitter(tip, { -- bow wave: thin streaks flaring out and back off the tip
-		Texture = Tex.Streak,
+	beam(unit * 2.4, unit * 8, ColorSequence.new(color, edge), Seq({ { 0, 0.35 }, { 0.5, 0.65 }, { 1, 1 } }), -1.5) -- glow
+	beam(unit, unit * 3, ColorSequence.new(WHITE, color), Seq({ { 0, 0.1 }, { 0.6, 0.5 }, { 1, 1 } }), -2.5) -- core
+
+	VFXUtil.Emitter(bolt, { -- sparkles shed into its wake
+		Texture = Tex.Glow,
 		Color = hot,
-		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, radius * 2, radius * 0.8), NumberSequenceKeypoint.new(1, radius * 0.6) }),
-		Squash = NumberSequence.new(1.5),
-		Transparency = Seq({ { 0, 0 }, { 0.6, 0.3 }, { 1, 1 } }),
-		Lifetime = NumberRange.new(0.1, 0.2),
-		Speed = NumberRange.new(25, 45),
-		EmissionDirection = back,
-		SpreadAngle = Vector2.new(60, 60),
-		Drag = 3,
-		Rate = 60,
-	})] = 18
-	VFXUtil.Emitter(tip, { -- bright chips thrown off the tip
-		Texture = Tex.Flare,
-		Color = hot,
-		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, radius * 1.2, radius * 0.5), NumberSequenceKeypoint.new(1, 0) }),
-		Lifetime = NumberRange.new(0.15, 0.3),
-		Speed = NumberRange.new(10, 25),
-		EmissionDirection = back,
-		SpreadAngle = Vector2.new(70, 70),
-		Rotation = NumberRange.new(0, 360),
-		Drag = 4,
-		Rate = 22,
+		LightEmission = 1,
+		Shape = Enum.ParticleEmitterShape.Box,
+		ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume,
+		Size = Seq({ { 0, unit * 0.35 }, { 1, 0 } }),
+		Transparency = Seq({ { 0, 0 }, { 1, 1 } }),
+		Lifetime = NumberRange.new(0.3, 0.6),
+		Speed = NumberRange.new(1, 4),
+		SpreadAngle = Vector2.new(180, 180),
+		Drag = 2,
+		Rate = 45,
 	})
-	aligned[VFXUtil.Emitter(tip, { -- arrowhead: a sharp white spike riding the tip
-		Texture = Tex.Streak,
-		Color = ColorSequence.new(WHITE),
-		Size = NumberSequence.new(radius * 4),
-		Transparency = Seq({ { 0, 0 }, { 1, 0.6 } }),
-		Lifetime = NumberRange.new(0.05),
+
+	-- Crystal head: a spearhead forward, long spikes splayed back from the flight line and a ring
+	-- of short, chunky crystals round the core (the head frame looks along the flight: +Z is behind).
+	local light2, dark = WHITE:Lerp(color, 0.35), edge:Lerp(color, 0.3)
+	local crystals: { Crystal } = {}
+	local function addCrystal(base: Vector3, direction: Vector3, length: number, width: number)
+		table.insert(crystals, {
+			Parts = newCrystal(light2, dark, bolt),
+			Frame = aim(base, direction),
+			Direction = direction,
+			Length = length,
+			Width = width,
+			Appear = 0,
+		})
+	end
+	addCrystal(Vector3.new(0, 0, unit * 0.4), -Vector3.zAxis, unit * 2.6, unit * 1.1)
+	for i = 1, 5 do
+		local azimuth = i * 2 * math.pi / 5
+		local tilt = math.rad(26 + 14 * ((i * 0.618) % 1))
+		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), math.cos(tilt))
+		local length = unit * (3.2 + 1.4 * ((i * 0.382) % 1))
+		addCrystal(Vector3.new(0, 0, -unit * 0.2), direction, length, length * 0.4)
+	end
+	for i = 1, 4 do
+		local azimuth = (i + 0.5) * 2 * math.pi / 4
+		local tilt = math.rad(60 + 20 * ((i * 0.618) % 1))
+		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), math.cos(tilt))
+		addCrystal(Vector3.new(0, 0, unit * 0.1), direction, unit * 1.8, unit * 1.4)
+	end
+	for _, crystal in crystals do
+		fadeCrystal(crystal.Parts, 0)
+		placeCrystal(crystal.Parts, crystal.Frame, crystal.Length, crystal.Width, true) -- sized once; after this they only move
+	end
+
+	-- Ribbons: three bands twisting round the wake, and a thin wavy streamer down the middle.
+	local helixColors = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, WHITE),
+		ColorSequenceKeypoint.new(0.4, color),
+		ColorSequenceKeypoint.new(1, edge),
+	})
+	local helix = {}
+	for i = 1, 3 do
+		table.insert(helix, newRibbon(bolt, helixColors, 0.26, false, (i - 1) * 2 * math.pi / 3))
+	end
+	local decor: Decor = {
+		Unit = unit,
+		Crystals = crystals,
+		Helix = helix,
+		Tail = newRibbon(bolt, ColorSequence.new(light2, edge), 0.38, true, 0),
+		Spin = 0,
+		Phase = 0,
+	}
+	return bolt, tail, decor
+end
+
+-- Moves the bolt's crystals and ribbons with it (after its CFrame is set for this frame).
+local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
+	decor.Spin += dt * 2.5 -- the crystal head rolls slowly
+	decor.Phase += dt * 30 -- the ribbons wind round fast
+	local unit = decor.Unit
+	local head = bolt.CFrame * CFrame.Angles(0, 0, decor.Spin)
+	for _, crystal in decor.Crystals do
+		placeCrystal(crystal.Parts, head * crystal.Frame, crystal.Length, crystal.Width, false)
+	end
+	local behind = Vector3.new(0, 0, unit * 1.2)
+	for _, ribbon in decor.Helix do
+		local angle = decor.Phase + ribbon.Offset
+		local radius = unit * (1.3 + 0.35 * math.sin(decor.Phase * 0.31 + ribbon.Offset * 2))
+		local out = Vector3.new(math.cos(angle), math.sin(angle), 0)
+		ribbon.A0.Position = behind + out * radius
+		ribbon.A1.Position = behind + out * (radius + unit * 0.45)
+	end
+	local wobble = Vector3.new(math.sin(decor.Phase * 0.45) * unit * 0.9, 0, unit * 1.5)
+	decor.Tail.A0.Position = wobble
+	decor.Tail.A1.Position = wobble + Vector3.new(0, unit * 0.5, 0)
+end
+
+-- A small burst where a bolt leaves the mouth (or the parrying player).
+local function stormMuzzle(position: Vector3, color: Color3)
+	local a = VFXUtil.At(position, 0.6)
+	if not a then
+		return
+	end
+	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
+	VFXUtil.Ring(a, VFXUtil.Hot(WHITE, color), 0.5, unit * 10, 0.2):Emit(1)
+	VFXUtil.Emitter(a, {
+		Texture = Tex.Glow,
+		Color = ColorSequence.new(WHITE, color),
+		LightEmission = 1,
+		Size = Fade(unit * 6, unit * 2),
+		Transparency = Fade(0, 1),
+		Lifetime = NumberRange.new(0.12),
 		Speed = NumberRange.new(0),
 		LockedToPart = true,
 		ZOffset = 1,
-		Rate = 60,
-	})] = 0
+	}):Emit(1)
+end
 
-	-- Volume around the line.
-	aligned[VFXUtil.Emitter(bolt, { -- long faint dashes streaming past
-		Texture = Tex.Streak,
-		Color = ColorSequence.new(WHITE:Lerp(color, 0.4)),
-		LightEmission = 0.5,
-		Shape = Enum.ParticleEmitterShape.Box,
-		ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume,
-		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, radius * 3.5, radius * 1.5), NumberSequenceKeypoint.new(1, radius * 3.5, radius * 1.5) }),
-		Squash = NumberSequence.new(1.5), -- positive = longer and thinner along the (rotated) streak
-		Transparency = Seq({ { 0, 1 }, { 0.2, 0.45 }, { 1, 1 } }),
-		Lifetime = NumberRange.new(0.25, 0.4),
-		Speed = NumberRange.new(3, 8),
-		EmissionDirection = back,
-		Rate = 30,
-	})] = 0
-	return bolt, aligned, tail
+-------------------------------------------------------------------------------- exploding (impact)
+
+type Shard = {
+	Parts: { BasePart },
+	Origin: Vector3,
+	Velocity: Vector3,
+	Tumble: Vector3, -- axis it spins about as it flies
+	Length: number,
+	Width: number,
+	Start: number,
+	Life: number,
+}
+
+local shards: { Shard } = {}
+
+-- Moves an explosion shard for this frame; false once it has faded out (and is destroyed).
+local function updateShard(shard: Shard, now: number): boolean
+	local t = now - shard.Start
+	if t >= shard.Life then
+		destroyAll(shard.Parts)
+		return false
+	end
+	local position = shard.Origin + shard.Velocity * ((1 - math.exp(-SHARD_DRAG * t)) / SHARD_DRAG) - Vector3.yAxis * (14 * t * t)
+	local frame = aim(position, shard.Velocity) * CFrame.fromAxisAngle(shard.Tumble, t * 9)
+	local life = t / shard.Life
+	local scale = 1 - smooth((life - 0.35) / 0.65)
+	placeCrystal(shard.Parts, frame, shard.Length * scale, shard.Width * scale, true)
+	fadeCrystal(shard.Parts, smooth((life - 0.55) / 0.45))
+	return true
+end
+
+local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel: Vector3)
+	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
+	local hot = VFXUtil.Hot(WHITE, color)
+	local a = VFXUtil.At(position, 1.2)
+	if a then
+		VFXUtil.Emitter(a, { -- the flash
+			Texture = Tex.Glow,
+			Color = ColorSequence.new(WHITE, color),
+			LightEmission = 1,
+			Size = Seq({ { 0, unit * 4 }, { 0.25, unit * 14 }, { 1, unit * 16 } }),
+			Transparency = Seq({ { 0, 0 }, { 0.35, 0.25 }, { 1, 1 } }),
+			Lifetime = NumberRange.new(0.28),
+			Speed = NumberRange.new(0),
+			LockedToPart = true,
+			ZOffset = 1,
+		}):Emit(1)
+		VFXUtil.Emitter(a, { -- white-hot centre
+			Texture = Tex.Glow,
+			Color = ColorSequence.new(WHITE),
+			Size = Fade(unit * 6, unit * 2),
+			Transparency = Fade(0, 1),
+			Lifetime = NumberRange.new(0.1),
+			Speed = NumberRange.new(0),
+			LockedToPart = true,
+			ZOffset = 2,
+		}):Emit(1)
+		VFXUtil.Ring(a, hot, 1, unit * 22, 0.28):Emit(1)
+		VFXUtil.Ring(a, ColorSequence.new(edge), 1, unit * 32, 0.45):Emit(1)
+		VFXUtil.Emitter(a, { -- sparkles flung out, drifting down
+			Texture = Tex.Glow,
+			Color = hot,
+			LightEmission = 1,
+			Size = Seq({ { 0, unit * 0.45 }, { 1, 0 } }),
+			Lifetime = NumberRange.new(0.4, 0.9),
+			Speed = NumberRange.new(8, 26),
+			SpreadAngle = Vector2.new(180, 180),
+			Drag = 3,
+			Acceleration = Vector3.new(0, -8, 0),
+		}):Emit(36)
+		VFXUtil.Emitter(a, { -- a puff of icy mist
+			Texture = Tex.Smoke,
+			Color = ColorSequence.new(color),
+			LightEmission = 0.3,
+			Size = Fade(unit * 3, unit * 7),
+			Transparency = Fade(0.6, 1),
+			Lifetime = NumberRange.new(0.4, 0.6),
+			Speed = NumberRange.new(2, 5),
+			SpreadAngle = Vector2.new(180, 180),
+			Rotation = NumberRange.new(0, 360),
+		}):Emit(5)
+		VFXUtil.Flash(a, color, 18, 6, 0.3)
+	end
+
+	-- Crystal shards and needle rays flung outward, mostly back the way it came.
+	local folder = fxFolder()
+	if not folder then
+		return
+	end
+	local light, dark = WHITE:Lerp(color, 0.35), edge:Lerp(color, 0.3)
+	local back = if travel.Magnitude > 1e-3 then -travel.Unit else Vector3.zero
+	local now = os.clock()
+	local function fling(count: number, speed: NumberRange, length: NumberRange, thinness: number, life: NumberRange)
+		for _ = 1, count do
+			local direction = (randomUnit() + back * 0.6).Unit
+			local size = length.Min + (length.Max - length.Min) * math.random()
+			local shard: Shard = {
+				Parts = newCrystal(light, dark, folder),
+				Origin = position,
+				Velocity = direction * (speed.Min + (speed.Max - speed.Min) * math.random()),
+				Tumble = randomUnit(),
+				Length = size,
+				Width = size * thinness,
+				Start = now,
+				Life = life.Min + (life.Max - life.Min) * math.random(),
+			}
+			table.insert(shards, shard)
+			updateShard(shard, now)
+		end
+	end
+	fling(8, NumberRange.new(24, 42), NumberRange.new(unit * 2, unit * 3.6), 0.45, NumberRange.new(0.45, 0.7)) -- shards
+	fling(8, NumberRange.new(45, 65), NumberRange.new(unit * 4, unit * 7), 0.08, NumberRange.new(0.2, 0.3)) -- rays
 end
 
 local function clearCharge(model: Model)
@@ -655,6 +1063,13 @@ local function endProjectile(id: number, position: Vector3?, reason: string?)
 	end
 	projectiles[id] = nil
 	local color = projectile.Color
+	local decor = projectile.Decor
+	if decor then
+		-- The crystal head shatters (the burst below flings the shards) or blinks out at range.
+		for _, crystal in decor.Crystals do
+			destroyAll(crystal.Parts)
+		end
+	end
 	-- Let the trail and wake finish instead of vanishing with the orb.
 	local part = projectile.Part
 	part.Transparency = 1
@@ -667,6 +1082,11 @@ local function endProjectile(id: number, position: Vector3?, reason: string?)
 	end
 	Debris:AddItem(part, 0.4)
 	if not position or reason == "Expired" then
+		return
+	end
+	if decor then
+		stormBurst(position, color, projectile.Edge or BOLT_EDGE, projectile.Direction)
+		SFX.Play("BulletImpact", position)
 		return
 	end
 	local a = VFXUtil.At(position, 0.8)
@@ -703,7 +1123,7 @@ local function onEnemyProjectile(kind: string, id: number, a: any, b: any, c: an
 	if kind == "Fire" then
 		local origin, direction, speed, range, style = a, b, c, d, e
 		-- Blasts are cyan (parryable); a reflected projectile takes the player's attack colour; the
-		-- Stormfin's Storm Bolt is blue-white lightning.
+		-- Stormfin's Storm Bolt is blue-white storm-ice.
 		local color = PARRYABLE_COLOR
 		local radius = DummyConfig.Blast.Radius
 		local edge = BOLT_EDGE
@@ -718,11 +1138,12 @@ local function onEnemyProjectile(kind: string, id: number, a: any, b: any, c: an
 			radius = StormfinConfig.Bolt.Radius
 		end
 		if style == "StormBolt" or style == "ReflectedStormBolt" then
-			local bolt, aligned, tail = makeStormBolt(color, edge, radius)
+			local bolt, tail, decor = makeStormBolt(color, edge, radius)
 			bolt.CFrame = CFrame.lookAt(origin, origin + direction)
-			alignStreaks(aligned, origin, direction)
+			updateBoltDecor(bolt, decor, 0)
 			bolt.Parent = fxFolder()
-			projectiles[id] = { Part = bolt, Color = color, Origin = origin, Direction = direction, Speed = speed, Range = range, Start = os.clock(), Style = style, Aligned = aligned, Tail = tail }
+			stormMuzzle(origin, color)
+			projectiles[id] = { Part = bolt, Color = color, Edge = edge, Origin = origin, Direction = direction, Speed = speed, Range = range, Start = os.clock(), Style = style, Tail = tail, Decor = decor }
 			return
 		end
 		-- The neon core is smaller than the hit radius; the halo shows the full size.
@@ -769,7 +1190,7 @@ end
 function EnemyVisuals.Init()
 	Remotes.EnemyAttack.OnClientEvent:Connect(onEnemyAttack)
 	Remotes.EnemyProjectile.OnClientEvent:Connect(onEnemyProjectile)
-	RunService.RenderStepped:Connect(function()
+	RunService.RenderStepped:Connect(function(dt)
 		local now = os.clock()
 		for id, projectile in projectiles do
 			local traveled = projectile.Speed * (now - projectile.Start)
@@ -778,13 +1199,25 @@ function EnemyVisuals.Init()
 			else
 				local at = projectile.Origin + projectile.Direction * traveled
 				projectile.Part.CFrame = CFrame.lookAt(at, at + projectile.Direction)
-				if projectile.Aligned then
-					alignStreaks(projectile.Aligned, at, projectile.Direction)
+				if projectile.Decor then
+					updateBoltDecor(projectile.Part, projectile.Decor, dt)
 				end
 				if projectile.Tail then
 					-- +Z is behind the part (it looks along the flight); never behind the muzzle.
 					projectile.Tail.Position = Vector3.new(0, 0, math.min(traveled, BOLT_LENGTH))
 				end
+			end
+		end
+		-- Storm Bolt charges and explosion shards (backwards: finished ones are removed).
+		for i = #charges, 1, -1 do
+			local charge = charges[i]
+			if not updateCharge(charge, now) then
+				endCharge(charge)
+			end
+		end
+		for i = #shards, 1, -1 do
+			if not updateShard(shards[i], now) then
+				table.remove(shards, i)
 			end
 		end
 	end)

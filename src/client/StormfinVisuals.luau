@@ -94,6 +94,7 @@ type View = {
 	Phase: number,
 	FlinchUntil: number,
 	Dead: boolean,
+	StopCharge: (() -> ())?, -- cancels the Storm Bolt growing at the mouth
 }
 
 local views: { [number]: View } = {}
@@ -269,6 +270,7 @@ local function newView(id: number, serverModel: Model?, model: Model, effects: E
 		Phase = math.random() * 10,
 		FlinchUntil = 0,
 		Dead = false,
+		StopCharge = nil,
 	}
 end
 
@@ -367,7 +369,16 @@ local function build(id: number, serverModel: Model?): View
 	return view
 end
 
+-- Takes down a Storm Bolt still growing at the mouth (it was interrupted, or the fin is gone).
+local function stopCharge(view: View)
+	if view.StopCharge then
+		view.StopCharge()
+		view.StopCharge = nil
+	end
+end
+
 local function destroy(view: View)
+	stopCharge(view)
 	view.Model:Destroy()
 	view.Surface:Destroy()
 	views[view.Id] = nil
@@ -429,6 +440,7 @@ end
 local function onSegment(view: View, segment: Motion.Segment)
 	view.Previous = view.Segment
 	view.Segment = segment
+	stopCharge(view)
 	-- The segment reaches us a little after it started; ease out the gap between where we last drew
 	-- the fish (still on the old segment) and where the new one puts it at that same moment.
 	if view.Drawn then
@@ -461,6 +473,9 @@ local function onSegment(view: View, segment: Motion.Segment)
 					return
 				end
 				EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, chargeTime, view.Mouth)
+				-- The bolt grows at the mouth: orb, crystals sprouting, streams whirling round it.
+				stopCharge(view)
+				view.StopCharge = EnemyVisuals.ChargeStormBolt(view.Mouth, chargeTime)
 				view.ChargeGlow.Rate = 40
 				view.Arcs.Rate = 45
 				VFXUtil.Flash(view.Mouth, Visuals.BoltColor, 14, 3, chargeTime)
@@ -487,6 +502,7 @@ end
 
 local function onDeath(view: View)
 	view.Dead = true
+	stopCharge(view)
 	EnemyVisuals.ClearTelegraph(view.Model)
 	view.Arcs.Rate = 0
 	view.ChargeGlow.Rate = 0
