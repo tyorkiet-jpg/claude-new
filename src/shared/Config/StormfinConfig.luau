@@ -102,9 +102,10 @@ local StormfinConfig = {
 		ArcColor = Color3.fromRGB(190, 220, 255), -- crackling lightning
 		EyeColor = Color3.fromRGB(225, 240, 255), -- electric white
 		RippleColor = Color3.fromRGB(120, 175, 255),
-		-- Storm Bolt: blue-white lightning, clearly different from the player's purple, which a
-		-- reflected bolt takes on.
-		BoltColor = Color3.fromRGB(185, 215, 255),
+		-- Storm Bolt: deep blue storm-water to suit the dark sea (user, 10 Oct 2026), clearly
+		-- different from the player's purple, which a reflected bolt takes on. Its brightest
+		-- highlights are a lighter tint of this, never white.
+		BoltColor = Color3.fromRGB(35, 80, 210),
 		FinFlapSpeed = 7, -- radians/s swimming (hover is slower)
 	},
 }

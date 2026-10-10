@@ -326,7 +326,7 @@ end
 -- A droplet is a glowing ball (a part with a sphere mesh, scaled rather than resized) with a
 -- camera-facing Beam tail tapering to a point, so it reads as a teardrop from any angle and points
 -- the way it moves (see newDroplet). The streams are Trails on attachments that orbit every frame.
-local BOLT_EDGE = Color3.fromRGB(70, 140, 255) -- deep blue edge of the Stormfin's own bolt
+local BOLT_EDGE = Color3.fromRGB(12, 28, 100) -- navy edge of the Stormfin's own (deep blue) bolt
 local BOLT_LENGTH = 9 -- studs of comet glow behind the head
 local BOLT_SCALE = 0.55 -- overall size of the effect relative to the hit radius (user: it was too large)
 local DROPLET_ALPHA = 0.15 -- glowing water...
@@ -339,6 +339,12 @@ local CHARGE_HOLD = 0.35 -- seconds the full orb waits at the mouth for the bolt
 local BOLT_DROPLETS = 6
 local SPLASH_DRAG = 3.5 -- 1/s: air drag on the splash droplets...
 local SPLASH_GRAVITY = 60 -- ...and how hard they fall (studs/s²)
+
+-- The brightest a bolt gets: a light tint of its own colour, never white (the Stormfin's bolt is
+-- deep blue to suit the dark storm sea; a reflected one stays the player's purple).
+local function glint(color: Color3): Color3
+	return color:Lerp(WHITE, 0.35)
+end
 
 local function smooth(x: number): number
 	x = math.clamp(x, 0, 1)
@@ -473,7 +479,7 @@ end
 
 -- Body and tail colours of the bolt's water.
 local function waterColors(color: Color3, edge: Color3): (Color3, Color3)
-	return WHITE:Lerp(color, 0.55), color:Lerp(edge, 0.45)
+	return color:Lerp(WHITE, 0.12), color:Lerp(edge, 0.5)
 end
 
 -------------------------------------------------------------------------------- growing (charge)
@@ -590,7 +596,7 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 	})
 	local intake = VFXUtil.Emitter(holder, { -- fine mist drawn in from all round
 		Texture = Tex.Glow,
-		Color = VFXUtil.Hot(color, WHITE),
+		Color = VFXUtil.Hot(color, glint(color)),
 		LightEmission = 1,
 		Shape = Enum.ParticleEmitterShape.Sphere,
 		ShapeInOut = Enum.ParticleEmitterShapeInOut.Inward,
@@ -623,8 +629,8 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 		})
 	end
 	local ribbons = {
-		newRibbon(holder, ColorSequence.new(WHITE, color), 0.16, true, 0),
-		newRibbon(holder, ColorSequence.new(WHITE, color), 0.16, true, math.pi),
+		newRibbon(holder, ColorSequence.new(glint(color), color), 0.16, true, 0),
+		newRibbon(holder, ColorSequence.new(glint(color), color), 0.16, true, math.pi),
 	}
 
 	holder.Parent = folder
@@ -680,7 +686,7 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 
 	VFXUtil.Emitter(tip, { -- bright heart of the drop
 		Texture = Tex.Glow,
-		Color = ColorSequence.new(WHITE, WHITE:Lerp(color, 0.5)),
+		Color = ColorSequence.new(glint(color), color),
 		Size = NumberSequence.new(unit * 1.8),
 		Transparency = Seq({ { 0, 0 }, { 1, 0.5 } }),
 		Lifetime = NumberRange.new(0.08),
@@ -725,11 +731,11 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 		b.Parent = bolt
 	end
 	beam(unit * 2.4, unit * 8, ColorSequence.new(color, edge), Seq({ { 0, 0.35 }, { 0.5, 0.65 }, { 1, 1 } }), -1.5) -- glow
-	beam(unit, unit * 3, ColorSequence.new(WHITE, color), Seq({ { 0, 0.1 }, { 0.6, 0.5 }, { 1, 1 } }), -2.5) -- core
+	beam(unit, unit * 3, ColorSequence.new(glint(color), color), Seq({ { 0, 0.1 }, { 0.6, 0.5 }, { 1, 1 } }), -2.5) -- core
 
 	VFXUtil.Emitter(bolt, { -- spray shed into its wake, falling away
 		Texture = Tex.Glow,
-		Color = VFXUtil.Hot(WHITE, color),
+		Color = VFXUtil.Hot(glint(color), color),
 		LightEmission = 1,
 		Shape = Enum.ParticleEmitterShape.Box,
 		ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume,
@@ -768,7 +774,7 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 
 	-- Streams: three bands twisting round the wake, and a thin wavy streamer down the middle.
 	local helixColors = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, WHITE),
+		ColorSequenceKeypoint.new(0, glint(color)),
 		ColorSequenceKeypoint.new(0.4, color),
 		ColorSequenceKeypoint.new(1, edge),
 	})
@@ -817,10 +823,10 @@ local function stormMuzzle(position: Vector3, color: Color3)
 		return
 	end
 	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
-	VFXUtil.Ring(a, VFXUtil.Hot(WHITE, color), 0.5, unit * 10, 0.2):Emit(1)
+	VFXUtil.Ring(a, VFXUtil.Hot(glint(color), color), 0.5, unit * 10, 0.2):Emit(1)
 	VFXUtil.Emitter(a, {
 		Texture = Tex.Glow,
-		Color = ColorSequence.new(WHITE, color),
+		Color = ColorSequence.new(glint(color), color),
 		LightEmission = 1,
 		Size = Fade(unit * 6, unit * 2),
 		Transparency = Fade(0, 1),
@@ -864,12 +870,12 @@ end
 
 local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel: Vector3)
 	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
-	local hot = VFXUtil.Hot(WHITE, color)
+	local hot = VFXUtil.Hot(glint(color), color)
 	local a = VFXUtil.At(position, 1.2)
 	if a then
 		VFXUtil.Emitter(a, { -- the flash
 			Texture = Tex.Glow,
-			Color = ColorSequence.new(WHITE, color),
+			Color = ColorSequence.new(glint(color), color),
 			LightEmission = 1,
 			Size = Seq({ { 0, unit * 4 }, { 0.25, unit * 14 }, { 1, unit * 16 } }),
 			Transparency = Seq({ { 0, 0 }, { 0.35, 0.25 }, { 1, 1 } }),
@@ -880,7 +886,7 @@ local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel
 		}):Emit(1)
 		VFXUtil.Emitter(a, { -- bright centre
 			Texture = Tex.Glow,
-			Color = ColorSequence.new(WHITE),
+			Color = ColorSequence.new(glint(color)),
 			Size = Fade(unit * 6, unit * 2),
 			Transparency = Fade(0, 1),
 			Lifetime = NumberRange.new(0.1),
@@ -1168,7 +1174,7 @@ local function onEnemyProjectile(kind: string, id: number, a: any, b: any, c: an
 	if kind == "Fire" then
 		local origin, direction, speed, range, style = a, b, c, d, e
 		-- Blasts are cyan (parryable); a reflected projectile takes the player's attack colour; the
-		-- Stormfin's Storm Bolt is blue-white storm-water.
+		-- Stormfin's Storm Bolt is deep blue storm-water.
 		local color = PARRYABLE_COLOR
 		local radius = DummyConfig.Blast.Radius
 		local edge = BOLT_EDGE
