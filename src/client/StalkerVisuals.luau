@@ -91,8 +91,8 @@ local DUTY = { { 0, 0.72 }, { 5, 0.65 }, { 7, 0.6 }, { 10, 0.46 }, { 14, 0.4 }, 
 local STAND_DROP = 0.15 -- studs lower than the model's straight-legged rest pose, standing still
 local LEG_SLACK = 0.94 -- legs stand at most this fraction of their full length (never locked straight)
 local GIRDLE = { Front = 0.3, Hind = 0.18, Rise = 0.1 } -- shoulder blade / pelvis travel with each stride (studs)
-local MOVE_ON, MOVE_OFF = 1.6, 0.9 -- studs/s: it starts / stops stepping in gait above / below these
-local IDLE_STEP_ERROR = 0.4 -- studs: standing, a foot this far from where it should be steps
+local MOVE_ON, MOVE_OFF = 0.7, 0.35 -- studs/s: it starts / stops stepping in gait above / below these
+local IDLE_STEP_ERROR = 0.22 -- studs: standing, a foot this far from where it should be steps
 local IDLE_STEP_TIME = 0.26
 local MAX_PLANT_ERROR = 6 -- studs: a planted foot this far off (a teleport) snaps instead of stepping
 local RETARGET_UNTIL = 0.7 -- of a swing: the landing spot follows the body until then, then holds
@@ -444,6 +444,10 @@ local function buildBody(id: number): Body?
 		local joint = body.Joint[leg] - UP * STAND_DROP
 		local endOffset = if FRONT[leg] then Vector3.zero else -body.Meta[leg]
 		local target = body.Stance[leg]
+		if not FRONT[leg] then
+			-- The hind feet stand under the hips, not splayed out past them.
+			target = Vector3.new(target.X + (joint.X - target.X) * 0.6, target.Y, target.Z)
+		end
 		local under = Vector3.new(joint.X, target.Y, joint.Z)
 		for _ = 1, 20 do
 			if (target + endOffset - joint).Magnitude <= body.Reach[leg] * LEG_SLACK then
@@ -605,7 +609,7 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 			local basis = if pose.Flight >= 0 or pose.Collapse > 0.5 then modelCF else ground:Lerp(modelCF, lifted * 0.6)
 			local hip = (posed.Hips * relative[thigh]).Position + modelCF:VectorToWorldSpace(view.Feet[leg].Girdle)
 			local metaWorld = basis:VectorToWorldSpace(body.Meta[leg])
-			local bend = modelCF:VectorToWorldSpace(Vector3.new(side * 0.3, 0, -1))
+			local bend = modelCF:VectorToWorldSpace(Vector3.new(side * 0.12, 0, -1))
 			local knee, hock = solveLimb(hip, view.Feet[leg].Position - metaWorld, bend, body.Length[thigh], body.Length[shin])
 			aim(thigh, hip, knee, modelCF)
 			aim(shin, knee, hock, modelCF)
