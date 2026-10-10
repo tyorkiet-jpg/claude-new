@@ -2,7 +2,8 @@
 -- (can't be damaged) -> Thunder Breach (a parryable leap at the player) or Storm Bolt (hover, charge,
 -- fire a reflectable bolt; the throat is a weak point while charging) -> dive -> repeat.
 -- Motion is a chain of StormfinMotion segments broadcast to clients; the server moves an invisible
--- hitbox along the same path and decides every hit, parry and point of damage.
+-- hitbox along the same path and decides every hit, parry and point of damage. Each new segment
+-- starts from the fin's current position and velocity, so momentum carries between phases.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -56,6 +57,13 @@ local function evaluate(fin: Fin): (Vector3, Vector3)
 	return position, forward
 end
 
+-- Server time, position, facing and velocity of the fin right now (a new segment starts from these).
+local function state(fin: Fin): (number, Vector3, Vector3, Vector3)
+	local t = now()
+	local position, forward = Motion.Evaluate(fin.Segment, t)
+	return t, position, forward, Motion.Velocity(fin.Segment, t)
+end
+
 -- Starts a new motion segment. The AI loop can't replace a stagger/death sequence (force = false).
 local function setSegment(fin: Fin, segment: Segment, force: boolean?): boolean
 	if not force and (fin.Interrupted or not fin.Alive) then
@@ -95,22 +103,8 @@ end
 -------------------------------------------------------------------------------- movement phases
 
 local function swimTo(fin: Fin, destination: Vector3): Segment?
-	local swim = Config.Swim
-	local a = evaluate(fin)
-	local b = Vector3.new(destination.X, Config.SwimDepth, destination.Z)
-	local delta = flat(b - a)
-	local side = unitOr(delta:Cross(UP), Vector3.xAxis) * (if random:NextNumber() < 0.5 then 1 else -1)
-	local c = a:Lerp(b, 0.5) + side * delta.Magnitude * swim.Curve
-	c = Vector3.new(c.X, Config.SwimDepth, c.Z)
-	local length = (c - a).Magnitude + (b - c).Magnitude
-	local segment: Segment = {
-		Kind = "Swim",
-		Start = now(),
-		Duration = math.clamp(length / swim.Speed, swim.MinTime, swim.MaxTime),
-		A = a,
-		B = b,
-		C = c,
-	}
+	local t, position, _, velocity = state(fin)
+	local segment = Motion.Swim(t, position, velocity, destination, if random:NextNumber() < 0.5 then 1 else -1)
 	return if setSegment(fin, segment) then segment else nil
 end
 
@@ -143,17 +137,8 @@ local function swimWatching(fin: Fin, segment: Segment?, targetRoot: BasePart?):
 end
 
 local function dive(fin: Fin, force: boolean?): Segment?
-	local position, forward = evaluate(fin)
-	local direction = unitOr(flat(forward), Vector3.xAxis)
-	local b = flat(position) + direction * 6 + UP * Config.SwimDepth
-	local segment: Segment = {
-		Kind = "Dive",
-		Start = now(),
-		Duration = Config.DiveTime,
-		A = position,
-		B = b,
-		Height = 1.5,
-	}
+	local t, position, forward, velocity = state(fin)
+	local segment = Motion.Dive(t, position, forward, velocity)
 	return if setSegment(fin, segment, force) then segment else nil
 end
 
@@ -165,13 +150,12 @@ local function stagger(fin: Fin, away: Vector3)
 	end
 	fin.Interrupted = true
 	task.spawn(function()
-		local breach = Config.Breach
-		local position = evaluate(fin)
-		local landing = flat(position) + away * 7 + UP * (Config.SurfaceY + 0.6)
-		local knock: Segment = { Kind = "Stagger", Start = now(), Duration = breach.StaggerTime, A = position, B = landing, Height = 3, Look = -away }
+		local t, position = state(fin)
+		local knock = Motion.Stagger(t, position, away)
 		setSegment(fin, knock, true)
 		if waitSegment(fin, knock) then
-			local stun: Segment = { Kind = "Stun", Start = now(), Duration = breach.StunTime, A = landing, B = landing, Look = -away }
+			local t2, landed, _, velocity = state(fin)
+			local stun = Motion.Stun(t2, landed, velocity, away)
 			setSegment(fin, stun, true)
 			if waitSegment(fin, stun) then
 				local down = dive(fin, true)
@@ -228,55 +212,37 @@ local function damagePlayer(fin: Fin, player: Player, character: Model, humanoid
 	end)
 end
 
--- Thunder Breach: crackling ripples mark the launch spot; it locks onto the player's position just
--- before launch (no midair homing) and leaps through it in an arc, back into the water.
+-- Thunder Breach: it glides on to a stop over the launch spot while crackling ripples mark it; it
+-- locks onto the player's position just before launch (no midair homing) and leaps through it
+-- under gravity, splashing down past them and gliding on underwater.
 local function breach(fin: Fin, targetRoot: BasePart)
 	local settings = Config.Breach
-	local start = evaluate(fin)
-	local launch = flat(start) + UP * (Config.SurfaceY - 1.3)
-	local look = unitOr(flat(targetRoot.Position - launch), Vector3.xAxis)
-	local windup: Segment = {
-		Kind = "Windup",
-		Start = now(),
-		Duration = settings.Windup,
-		A = start,
-		B = launch,
-		Look = look,
-		Extra = { Parryable = settings.Parryable },
-	}
+	local t, start, _, velocity = state(fin)
+	local windup = Motion.Windup(t, start, velocity, targetRoot.Position, settings.Parryable)
 	if not setSegment(fin, windup) then
 		return
 	end
+	local launch = windup.B :: Vector3
+	local look = windup.Look :: Vector3
 	if not waitSegment(fin, windup, windup.Start + settings.Windup - settings.CommitBefore) then
 		return
 	end
-	local aim = if targetRoot.Parent then targetRoot.Position else launch + look * 14
+	local aim = if targetRoot.Parent then targetRoot.Position + UP * (settings.AimHeight - 3) else launch + look * 14 + UP * 3
 	if not waitSegment(fin, windup) then
 		return
 	end
 
-	local toAim = flat(aim - launch)
-	local distance = math.max(toAim.Magnitude, 4)
-	local direction = unitOr(toAim, look)
-	local total = distance + settings.Overshoot
-	local landing = flat(launch) + direction * total + UP * (Config.SwimDepth * 0.6)
-	local u = distance / total
-	local baseY = launch.Y + (landing.Y - launch.Y) * u
-	local height = math.max((aim.Y - 3 + settings.AimHeight - baseY) / (4 * u * (1 - u)), 3)
-	local leap: Segment = {
-		Kind = "Leap",
-		Start = now(),
-		Duration = math.max(total / settings.Speed, 0.55),
-		A = launch,
-		B = landing,
-		Height = height,
-	}
+	local t2, from = state(fin)
+	local leap = Motion.Leap(t2, from, aim, look)
 	if not setSegment(fin, leap) then
 		return
 	end
+	local direction = unitOr(flat(leap.V :: Vector3), look)
 
+	-- Hits only while it is out of the water (plus a moment as it splashes down).
+	local airborne = leap.Start + Motion.EntryTime(leap) + 0.1
 	local alreadyHit: { [Player]: boolean } = {}
-	while fin.Segment == leap and now() < leap.Start + leap.Duration do
+	while fin.Segment == leap and now() < airborne do
 		local position, forward = evaluate(fin)
 		local head = position + forward * (Config.BodyLength * 0.3)
 		for _, player in Players:GetPlayers() do
@@ -288,8 +254,8 @@ local function breach(fin: Fin, targetRoot: BasePart)
 				-- a brush from the tail doesn't.
 				local tail = position - forward * (Config.BodyLength * settings.HitBack)
 				local segment = head - tail
-				local t = math.clamp((root.Position - tail):Dot(segment) / segment:Dot(segment), 0, 1)
-				if (root.Position - (tail + segment * t)).Magnitude <= settings.HitRadius then
+				local along = math.clamp((root.Position - tail):Dot(segment) / segment:Dot(segment), 0, 1)
+				if (root.Position - (tail + segment * along)).Magnitude <= settings.HitRadius then
 					alreadyHit[player] = true
 					damagePlayer(fin, player, character, humanoid, settings.Damage, head, settings.Parryable, function()
 						stagger(fin, -unitOr(flat(forward), direction))
@@ -299,6 +265,7 @@ local function breach(fin: Fin, targetRoot: BasePart)
 		end
 		RunService.Heartbeat:Wait()
 	end
+	waitSegment(fin, leap) -- the underwater glide
 end
 
 local function reflectBolt(player: Player, character: Model, from: Vector3, fin: Fin)
@@ -363,11 +330,11 @@ local function fireBolt(fin: Fin, origin: Vector3, targetPosition: Vector3)
 	})
 end
 
--- Storm Bolt: rises out of the water, hovers (the main window to shoot it), charges with the throat
--- exposed, fires at where the player is (no homing), stays open briefly, then dives.
+-- Storm Bolt: springs up out of the water, hovers (the main window to shoot it), charges with the
+-- throat exposed, fires at where the player is (no homing), stays open briefly, then dives.
 local function bolt(fin: Fin, targetRoot: BasePart)
 	local settings = Config.Bolt
-	local start = evaluate(fin)
+	local t, start, _, velocity = state(fin)
 	local spot = flat(start)
 	local toTarget = flat(targetRoot.Position) - spot
 	if toTarget.Magnitude < 12 then
@@ -376,19 +343,16 @@ local function bolt(fin: Fin, targetRoot: BasePart)
 	local hoverPoint = spot + UP * (Config.SurfaceY + random:NextNumber(settings.HoverHeight[1], settings.HoverHeight[2]))
 	local look = unitOr(flat(targetRoot.Position - hoverPoint), Vector3.xAxis)
 
-	local rise: Segment = { Kind = "Rise", Start = now(), Duration = settings.RiseTime, A = start, B = hoverPoint, Look = look }
+	local rise = Motion.Rise(t, start, velocity, hoverPoint, look)
 	if not setSegment(fin, rise) or not waitSegment(fin, rise) then
 		return
 	end
-	local hover: Segment = {
-		Kind = "Hover",
-		Start = now(),
-		Duration = settings.HoverTime,
-		A = hoverPoint,
-		B = hoverPoint,
-		Look = look,
-		Extra = { ChargeStart = settings.ChargeStart, ChargeTime = settings.ChargeTime, Parryable = settings.Parryable },
-	}
+	local t2, risen, _, riseVelocity = state(fin)
+	local hover = Motion.Hover(t2, risen, riseVelocity, hoverPoint, look, {
+		ChargeStart = settings.ChargeStart,
+		ChargeTime = settings.ChargeTime,
+		Parryable = settings.Parryable,
+	})
 	if not setSegment(fin, hover) then
 		return
 	end
@@ -465,17 +429,10 @@ local function die(fin: Fin)
 	end
 	fin.Alive = false
 	fin.Interrupted = true
-	local position, forward = evaluate(fin)
-	local duration = Config.DeathFloatTime + Config.DeathSinkTime
-	setSegment(fin, {
-		Kind = "Death",
-		Start = now(),
-		Duration = duration,
-		A = position,
-		B = position,
-		Look = unitOr(flat(forward), Vector3.xAxis),
-		Extra = { FloatTime = Config.DeathFloatTime },
-	}, true)
+	local t, position, forward, velocity = state(fin)
+	local death = Motion.Death(t, position, forward, velocity)
+	local duration = death.Duration
+	setSegment(fin, death, true)
 	Event:FireAllClients("Death", fin.Id)
 	task.delay(duration + 0.2, function()
 		fins[fin.Id] = nil
@@ -538,7 +495,7 @@ spawnFin = function()
 		Humanoid = humanoid,
 		Root = root,
 		Throat = throat,
-		Segment = { Kind = "Swim", Start = now(), Duration = 0, A = position, B = position, C = position },
+		Segment = Motion.Still(now(), position),
 		Alive = true,
 		Interrupted = false,
 		History = {},

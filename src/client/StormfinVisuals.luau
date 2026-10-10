@@ -1,6 +1,8 @@
 -- Client visuals for the Abyssal Stormfin. The server sends motion segments (StormfinEvent); this
 -- plays the creature along the same path (StormfinMotion), with a spine that follows its own trail
--- so it undulates like an eel. The creature is the user's rigged Meshy model
+-- so it undulates like an eel. The animation is driven by the motion: the tail beat is locked to how
+-- far it actually swims (so it never slides), it strokes harder when accelerating and just trails
+-- when coasting or flying, and it banks into turns. The creature is the user's rigged Meshy model
 -- (ReplicatedStorage/EnemyModels/Stormfin: a skinned MeshPart with bones Spine1 (head)..Spine6
 -- under Root) whose bones are driven along that spine; a part-built body is the fallback. Water carries the readability:
 -- glow + ripples while it hunts underwater, crackling ripples and the cyan parry cue before a
@@ -31,6 +33,19 @@ local WHITE = Color3.new(1, 1, 1)
 local SPINE_SPACING = Config.BodyLength / 6
 local MAX_JOINT_BEND = 0.45 -- radians between neighbouring spine segments: curls like a fish, never folds
 local TURN_BLEND = 0.22 -- seconds to swing from the old facing into a new segment's (no snapping)
+-- Swimming wave: it travels back along the body WAVE_STEP radians per spine point. Real eels push
+-- the wave back a little faster than they swim (slip ~0.8); beating slower than that looks like
+-- sliding through the water, so the beat is locked to forward speed: BEAT_PER_STUD radians per stud.
+local WAVE_STEP = 0.9
+local SLIP = 0.8
+local BEAT_PER_STUD = WAVE_STEP / (SLIP * SPINE_SPACING)
+local IDLE_BEAT = 3 -- radians/s: the slow scull while hovering or holding still
+local COAST_BEAT = 2.5 -- no thrust (airborne, or gliding after a splash): the tail just trails
+local THRASH_BEAT = 14 -- floundering on the surface
+local BANK_ACCEL = 60 -- studs/s² of sideways (turning) acceleration that banks it 45 degrees
+local MAX_BANK = 0.6 -- radians
+local CORRECTION_TIME = 0.15 -- seconds to ease out the small jump when a segment arrives late
+local MAX_CORRECTION = 8 -- studs; bigger jumps (a resync) snap
 local FLINCH_TIME = 0.22 -- hit reaction length
 local SHAKE_RANGE = 30 -- studs: a breach this close to you shakes the camera
 -- Spine segment sizes, head first: a sleek taper from a broad chest to a thin tail stalk. Each is
@@ -67,13 +82,15 @@ type View = {
 	Segment: Motion.Segment?,
 	Previous: Motion.Segment?,
 	LastY: number?,
-	LastCentre: Vector3?,
 	Forward: Vector3?, -- facing drawn last frame
 	BlendFrom: Vector3?, -- facing when the current segment began
 	BlendStart: number,
-	Speed: number, -- smoothed studs/s along the path
+	Drawn: Vector3?, -- body centre drawn last frame
+	Correction: Vector3, -- offset eased out after a late segment
+	CorrectionStart: number,
+	Accel: Vector3, -- smoothed acceleration (studs/s²)
 	Amplitude: number, -- smoothed undulation size
-	Roll: number, -- smoothed roll about the body axis (stun, death)
+	Roll: number, -- smoothed roll about the body axis (banking, stun, death)
 	Phase: number,
 	FlinchUntil: number,
 	Dead: boolean,
@@ -240,11 +257,13 @@ local function newView(id: number, serverModel: Model?, model: Model, effects: E
 		Segment = nil,
 		Previous = nil,
 		LastY = nil,
-		LastCentre = nil,
 		Forward = nil,
 		BlendFrom = nil,
 		BlendStart = 0,
-		Speed = 0,
+		Drawn = nil,
+		Correction = Vector3.zero,
+		CorrectionStart = 0,
+		Accel = Vector3.zero,
 		Amplitude = 0,
 		Roll = 0,
 		Phase = math.random() * 10,
@@ -412,11 +431,22 @@ local function onSegment(view: View, segment: Motion.Segment)
 	view.Segment = segment
 	view.BlendFrom = view.Forward
 	view.BlendStart = os.clock()
+	-- The segment reaches us a little after it started; ease out the gap between where we drew the
+	-- fish (still on the old segment) and where the new one says it is now.
+	if view.Drawn then
+		local gap = view.Drawn - Motion.Evaluate(segment, serverNow())
+		view.Correction = if gap.Magnitude < MAX_CORRECTION then gap else Vector3.zero
+		view.CorrectionStart = os.clock()
+	end
 	local kind = segment.Kind
 	local extra = segment.Extra or {}
 	if kind == "Windup" then
 		-- Crackling ripples brighten over the launch spot; the cyan glint says "parry this".
-		EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, segment.Duration, view.Surface)
+		-- The ring closes on the launch: time it from the server's clock, not from when this arrived.
+		local untilLaunch = segment.Start + segment.Duration - serverNow()
+		if untilLaunch > 0 then
+			EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, untilLaunch, view.Surface)
+		end
 		view.Ripples.Rate = 7
 		view.Arcs.Rate = 25
 	elseif kind == "Hover" then
@@ -486,19 +516,6 @@ local function smooth(x: number): number
 	return x * x * (3 - 2 * x)
 end
 
--- Turns unit vector `a` toward `b` by fraction `w` of the angle between them.
-local function turnToward(a: Vector3, b: Vector3, w: number): Vector3
-	local angle = math.acos(math.clamp(a:Dot(b), -1, 1))
-	if angle < 1e-4 then
-		return b
-	end
-	local axis = a:Cross(b)
-	if axis.Magnitude < 1e-5 then -- exactly reversed: swing round horizontally
-		axis = if math.abs(a.Y) < 0.99 then UP else Vector3.xAxis
-	end
-	return CFrame.fromAxisAngle(axis.Unit, angle * w):VectorToWorldSpace(a)
-end
-
 -- Point and head-ward direction on the drawn spine, `offset` studs ahead of the body centre
 -- (extrapolates a little past the head and tail).
 local function sampleSpine(drawn: { Vector3 }, offset: number): (Vector3, Vector3)
@@ -544,19 +561,30 @@ local function update(dt: number)
 			continue
 		end
 		local centre, forward, progress = Motion.Evaluate(segment, t)
+		local fade = (clock - view.CorrectionStart) / CORRECTION_TIME
+		if fade < 1 then
+			centre += view.Correction * (1 - smooth(fade))
+		end
+		view.Drawn = centre
 		-- Each segment starts with its own facing; swing into it from the old one instead of snapping.
 		local blend = (clock - view.BlendStart) / TURN_BLEND
 		if view.BlendFrom and blend < 1 then
-			forward = turnToward(view.BlendFrom, forward, smooth(blend))
+			forward = Motion.TurnToward(view.BlendFrom, forward, smooth(blend))
 		end
 		view.Forward = forward
 		local kind = segment.Kind
-		local moving = kind == "Swim" or kind == "Leap" or kind == "Dive" or kind == "Stagger"
+		-- What it is actually doing, from the motion itself (not frame-to-frame differences).
+		local velocity = Motion.Velocity(segment, t)
+		local accel = (velocity - Motion.Velocity(segment, t - 1 / 30)) * 30
+		view.Accel += (accel - view.Accel) * math.min(dt * 10, 1)
+		local speed = velocity.Magnitude
+		local moving = speed > 4
 		local hovering = kind == "Hover" or kind == "Rise" or kind == "Stun"
+		local powered = kind == "Swim" or kind == "Windup" or kind == "Rise" or kind == "Hover"
 		local submerged = centre.Y < Config.SubmergedBelow
 
-		-- Splash when it crosses the surface either way.
-		if view.LastY and not view.Dead then
+		-- Splash when it crosses the surface either way (a dead one falling in too).
+		if view.LastY then
 			local surface = Config.SurfaceY
 			if (view.LastY < surface) ~= (centre.Y < surface) then
 				splash(centre, kind == "Leap" or kind == "Rise")
@@ -591,19 +619,27 @@ local function update(dt: number)
 			previousDir = if settled.Magnitude > 1e-3 then settled.Unit else previousDir
 		end
 
-		-- Undulation: a travelling side-to-side wave, strongest at the tail. Swimming, it beats harder
-		-- and faster the faster it actually moves (slow repositions glide, long sprints thrash).
-		if view.LastCentre and dt > 0 then
-			local speed = (centre - view.LastCentre).Magnitude / dt
-			view.Speed += (speed - view.Speed) * math.min(dt * 6, 1)
-		end
-		view.LastCentre = centre
-		local effort = math.clamp(view.Speed / Config.Swim.Speed, 0, 1)
-		local speedFactor = if kind == "Swim" then 0.45 + 0.65 * effort elseif hovering then 0.45 else 0.6
-		view.Amplitude += (0.38 * speedFactor - view.Amplitude) * math.min(dt * 5, 1)
-		view.Phase += dt * (if hovering then 3 else 9) * speedFactor
+		-- Undulation: a wave travelling back along the body, strongest at the tail.
+		-- Powered (swimming, rising, hovering): the beat is locked to forward speed, and it strokes
+		-- harder while accelerating. Floundering: a fast thrash. Otherwise (airborne, or gliding after
+		-- a splash) there's no thrust: a slow, small trailing sway.
 		local side = forward:Cross(UP)
 		side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
+		local forwardSpeed = math.max(velocity:Dot(forward), 0)
+		local thrust = math.clamp(view.Accel:Dot(forward) / 40, 0, 1)
+		local beat, amplitude
+		if view.Dead then
+			beat, amplitude = 0, 0
+		elseif kind == "Stun" then
+			beat, amplitude = THRASH_BEAT, 0.5
+		elseif powered then
+			beat = math.max(IDLE_BEAT, forwardSpeed * BEAT_PER_STUD) * (1 + 0.4 * thrust)
+			amplitude = 0.16 + 0.3 * math.clamp(forwardSpeed / Config.Swim.Speed, 0, 1.3) + 0.2 * thrust
+		else
+			beat, amplitude = COAST_BEAT, 0.12
+		end
+		view.Amplitude += (amplitude - view.Amplitude) * math.min(dt * 8, 1)
+		view.Phase += dt * beat
 		local charging = view.ChargeGlow.Rate > 0
 		-- Tension: the whole body trembles as a breach winds up and while a bolt charges.
 		local tremble = if view.Dead then 0 elseif kind == "Windup" then smooth(progress / 0.8) elseif charging then 1 else 0
@@ -615,13 +651,17 @@ local function update(dt: number)
 		local drawn = {}
 		for i, point in points do
 			local along = (i - 1) / (#points - 1)
-			local wave = math.sin(view.Phase - i * 0.9) * view.Amplitude * along ^ 1.3
+			local wave = math.sin(view.Phase - i * WAVE_STEP) * view.Amplitude * along ^ 1.3
 			local shiver = math.sin(clock * 55 + i * 1.7) * 0.09 * tremble * (0.4 + 0.6 * along)
 			drawn[i] = point + side * (wave + shiver) + UP * flinch * 0.5 * (1 - i / #points)
 		end
-		-- Roll about the body axis: rocks onto its sides while floundering, belly-up when it dies.
+		-- Roll about the body axis: banks into turns while it swims or flies under its own power,
+		-- rocks onto its sides while floundering, belly-up when it dies.
 		local targetRoll = 0
-		if kind == "Stun" then
+		if powered and moving then
+			-- Turning right (accelerating toward its right) dips the right side.
+			targetRoll = -math.clamp(math.atan(view.Accel:Dot(side) / BANK_ACCEL), -MAX_BANK, MAX_BANK)
+		elseif kind == "Stun" then
 			targetRoll = 0.55 * math.sin((t - segment.Start) * 5)
 		elseif kind == "Death" then
 			targetRoll = math.pi * smooth((t - segment.Start - Config.DeathFloatTime * 0.5) / 1.1)
@@ -674,7 +714,7 @@ local function update(dt: number)
 		local showSurface = (submerged or kind == "Windup") and not view.Dead
 		view.SurfaceGlow.Enabled = showSurface
 		view.Ripples.Enabled = showSurface
-		view.Droplets.Rate = if (kind == "Leap" or kind == "Stagger") and not submerged then 45 else 0
+		view.Droplets.Rate = if (kind == "Leap" or kind == "Stagger" or kind == "Dive") and not submerged and not view.Dead then 45 else 0
 		view.Suspended.Rate = if kind == "Hover" and not view.Dead then 10 else 0
 	end
 end

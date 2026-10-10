@@ -27,6 +27,7 @@ local StormfinConfig = {
 		MaxTime = 2.2, -- keep underwater phases short: ~40-50% of the cycle should be targetable
 		KeepDistance = { 14, 24 }, -- where it repositions to, from the player
 		Curve = 0.45, -- how far the path bows sideways (fraction of its length)
+		ArriveSpeed = 16, -- studs/s it is still swimming at when it reaches its spot (it never stops dead; closer to Speed = a steadier pace)
 		AntiCampRange = 7, -- a player this close makes it attack right away
 		IdleRadius = 18, -- circling radius when nobody is in range
 	},
@@ -41,15 +42,18 @@ local StormfinConfig = {
 		Weight = 40,
 		Windup = 0.7, -- crackling ripples (parryable cue)
 		CommitBefore = 0.2, -- locks onto the player's position this long before launch (no midair homing)
-		Speed = 46, -- studs/s along the leap
-		Overshoot = 9, -- lands this far past the player
+		Speed = 46, -- studs/s across the ground during the leap (gravity decides the arc and where it lands)
+		MinAimTime = 0.26, -- seconds from launch to the player at the least: a very close player gets a slower, higher leap instead of a rocket straight up
+		MaxAimTime = 0.65, -- ...and at the most: a far player gets a faster leap instead of a sky-high one
 		AimHeight = 3, -- passes through the player at about chest height
 		Damage = 25,
 		HitRadius = 3.2,
 		HitBack = 0.05, -- hit capsule runs from the head to this fraction of BodyLength behind the centre (0.3 = the old whole-body hit)
 		Parryable = true,
-		StaggerTime = 0.55, -- a parried breach knocks it back...
-		StunTime = 1.3, -- ...then it flounders on the surface, open to fire
+		KnockBack = 14, -- studs/s: a parried breach is knocked back...
+		KnockUp = 16, -- ...and up (studs/s); it falls under Physics.Gravity
+		Splashdown = 0.25, -- seconds after it hits the water before it starts floundering...
+		StunTime = 1.3, -- ...on the surface, open to fire
 	},
 
 	Bolt = {
@@ -69,9 +73,24 @@ local StormfinConfig = {
 		ReflectDamage = 45,
 	},
 
-	DiveTime = 0.6,
-	DeathFloatTime = 0.7, -- hangs motionless before the glow fades and it sinks
+	Dive = {
+		Push = 6, -- studs/s forward kick as it tips over into a dive (added to its momentum)
+		Hop = 5, -- studs/s up; it then falls under Physics.Gravity
+	},
+	DeathFloatTime = 0.7, -- floats awash (after falling into the water, if it died in the air) before the glow fades and it sinks
 	DeathSinkTime = 2.2,
+
+	-- How it moves (StormfinMotion): momentum carries between moves, and anything airborne falls.
+	Physics = {
+		Gravity = 110, -- studs/s²: one gravity for every unpowered arc (leap, knockback, dive, falling dead). The world's is 196.2; lower gives the leaps some hang time
+		WaterDrag = 4.5, -- 1/s: how fast the water bleeds off speed after a splash-down (or when a swim runs over)
+		Buoyancy = 7, -- 1/s: how quickly it settles back to its depth after plunging in (critically damped)
+		Glide = 0.35, -- seconds it glides on underwater after a leap or dive before it swims again
+		LiftOmega = 8, -- 1/s: stiffness of the spring it rises and hovers on...
+		LiftDamping = 0.6, -- ...and its damping (below 1 overshoots: 0.6 is about 10%)
+		FloatOmega = 8, -- the spring it bobs on while floundering on the surface
+		FloatDamping = 0.5,
+	},
 
 	Visuals = {
 		BodyColor = Color3.fromRGB(14, 18, 48), -- deep midnight blue
