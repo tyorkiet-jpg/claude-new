@@ -51,7 +51,7 @@ type Projectile = {
 	Style: string?,
 	Edge: Color3?, -- Storm Bolt: deep outer colour
 	Tail: Attachment?, -- Storm Bolt wake end, trailing behind the head
-	Decor: Decor?, -- Storm Bolt crystals and ribbons, moved every frame
+	Decor: Decor?, -- Storm Bolt droplets and streams, moved every frame
 }
 
 local projectiles: { [number]: Projectile } = {}
@@ -314,25 +314,29 @@ local function makeIntake(color: Color3): BasePart
 	return intake
 end
 
--- Storm Bolt (Stormfin), after the user's "IceBall Magic" reference: a charged ball of storm-ice.
--- GROWING (EnemyVisuals.ChargeStormBolt, at the fin's mouth while it charges): a white-hot orb
--- swells, crystals sprout from it one by one, two energy streams whirl round it and sparkles are
--- drawn in. FIRING (makeStormBolt): a cluster of crystal spikes splaying back from a white-hot
--- core, ribbons twisting round its wake, a soft comet glow and a trail of sparkles. EXPLODING
--- (stormBurst): a flash, shockwave rings, needle rays, sparkles and crystal shards flung outward.
--- A parried bolt comes back as the same thing in the player's attack colour ("ReflectedStormBolt").
--- There are no crystal textures, so the crystals are real parts (crossed neon blades, see
--- newCrystal) and read as solid ice from any angle; the ribbons are Trails on attachments that
--- orbit the flight line every frame; the explosion's rays are thin crystals too, because
--- VelocityParallel particles stand across horizontal motion.
+-- Storm Bolt (Stormfin): a charged ball of storm-water, staged like the user's reference (growing,
+-- firing, exploding) but made of water droplets.
+-- GROWING (EnemyVisuals.ChargeStormBolt, at the fin's mouth while it charges): droplets spiral in
+-- from all round and are swallowed by a swelling water orb, two streams whirl round it and mist is
+-- drawn in. FIRING (makeStormBolt): one big glowing teardrop inside a see-through bubble, droplets
+-- circling it, streams twisting round its wake, a comet glow and spray falling away behind.
+-- EXPLODING (stormBurst): a flash, splash rings, mist and droplets bursting out, stretching as they
+-- fly and falling. A parried bolt comes back as the same thing in the player's attack colour
+-- ("ReflectedStormBolt").
+-- The droplets are real parts (a glowing ball with a stretched ellipsoid tail, see newDroplet) so
+-- they keep their teardrop shape and point the way they move; the streams are Trails on
+-- attachments that orbit every frame.
 local BOLT_EDGE = Color3.fromRGB(70, 140, 255) -- deep blue edge of the Stormfin's own bolt
 local BOLT_LENGTH = 9 -- studs of comet glow behind the head
 local BOLT_SCALE = 0.55 -- overall size of the effect relative to the hit radius (user: it was too large)
-local CRYSTAL_THICKNESS = 0.05 -- studs; each crystal blade is this thin
-local CRYSTAL_ALPHA = { 0.05, 0.05, 0.3, 0.3 } -- the light blade nearly solid, the dark one see-through
+local DROPLET_ALPHA = { 0.15, 0.4 } -- ball, tail: glowing water, the tail thinner
+local SHELL_ALPHA = { 0.72, 0.82 } -- the see-through bubble round the bolt's core
 local CHARGE_AHEAD = 0.7 -- studs in front of the mouth the charge grows
-local CHARGE_CRYSTALS = 7
-local SHARD_DRAG = 5 -- 1/s: how fast the explosion's shards slow down
+local CHARGE_DROPLETS = 8
+local CHARGE_CYCLE = 0.55 -- seconds a droplet takes to spiral in and be swallowed
+local BOLT_DROPLETS = 6
+local SPLASH_DRAG = 3.5 -- 1/s: air drag on the splash droplets...
+local SPLASH_GRAVITY = 60 -- ...and how hard they fall (studs/s²)
 
 local function smooth(x: number): number
 	x = math.clamp(x, 0, 1)
@@ -353,73 +357,67 @@ local function randomUnit(): Vector3
 	return if v.Magnitude > 1e-3 then v.Unit else Vector3.yAxis
 end
 
-type Crystal = {
-	Parts: { BasePart },
-	Frame: CFrame, -- (bolt) base and pointing direction, relative to the head
-	Direction: Vector3, -- (charge) pointing direction, relative to the mouth
-	Length: number,
-	Width: number,
-	Appear: number, -- (charge) charge progress at which it starts to sprout
-}
-
--- One ice crystal: two crossed blades, each an isosceles triangle of two mirrored wedges. A
--- WedgePart is thin along its front-bottom edge, so a wedge and a copy turned upside down beneath
--- it meet in a point at the front: the crystal points along its frame's LookVector (-Z).
-local function newCrystal(light: Color3, dark: Color3, parent: Instance): { BasePart }
-	local parts = {}
-	for i = 1, 4 do
-		local wedge = Instance.new("WedgePart")
-		wedge.Anchored = true
-		wedge.CanCollide = false
-		wedge.CanQuery = false
-		wedge.CanTouch = false
-		wedge.CastShadow = false
-		wedge.Material = Enum.Material.Neon
-		wedge.Color = if i <= 2 then light else dark
-		wedge.Transparency = 1 -- shown once placed (fadeCrystal)
-		wedge.Size = Vector3.new(CRYSTAL_THICKNESS, 0.1, 0.1)
-		wedge.Parent = parent
-		parts[i] = wedge
-	end
-	return parts
-end
-
--- Shows (0) to hides (1) a crystal.
-local function fadeCrystal(parts: { BasePart }, fade: number)
-	for i, part in parts do
-		part.Transparency = CRYSTAL_ALPHA[i] + (1 - CRYSTAL_ALPHA[i]) * fade
-	end
-end
-
--- Puts a crystal's base at frame.Position, pointing along frame.LookVector. `resize` only when the
--- length or width changed (resizing costs more than moving).
-local function placeCrystal(parts: { BasePart }, frame: CFrame, length: number, width: number, resize: boolean)
-	length = math.max(length, 0.02)
-	local half = math.max(width, 0.02) * 0.5
-	local centre = frame * CFrame.new(0, 0, -length * 0.5)
-	for blade = 0, 1 do
-		local bladeFrame = centre * CFrame.Angles(0, 0, blade * math.pi * 0.5)
-		local upper, lower = parts[blade * 2 + 1], parts[blade * 2 + 2]
-		if resize then
-			local size = Vector3.new(CRYSTAL_THICKNESS, half, length)
-			upper.Size = size
-			lower.Size = size
-		end
-		upper.CFrame = bladeFrame * CFrame.new(0, half * 0.5, 0)
-		lower.CFrame = bladeFrame * CFrame.new(0, -half * 0.5, 0) * CFrame.Angles(0, 0, math.pi)
-	end
-end
-
 local function destroyAll(parts: { Instance })
 	for _, part in parts do
 		part:Destroy()
 	end
 end
 
+-- One water droplet: a glowing ball with a stretched ellipsoid tail behind it, together a teardrop
+-- that points along its frame's LookVector (the way it moves).
+local function newDroplet(body: Color3, tail: Color3, parent: Instance): { BasePart }
+	local parts = {}
+	for i = 1, 2 do
+		local part = Instance.new("Part")
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.CastShadow = false
+		part.Material = Enum.Material.Neon
+		part.Transparency = 1 -- shown once placed (fadeDroplet)
+		if i == 1 then
+			part.Shape = Enum.PartType.Ball
+			part.Color = body
+		else
+			part.Color = tail
+			local mesh = Instance.new("SpecialMesh")
+			mesh.MeshType = Enum.MeshType.Sphere -- an ellipsoid filling the part's size
+			mesh.Parent = part
+		end
+		part.Size = Vector3.one * 0.1
+		part.Parent = parent
+		parts[i] = part
+	end
+	return parts
+end
+
+-- Shows (0) to hides (1) a droplet; `alpha` is its fully-shown transparency (ball, tail).
+local function fadeDroplet(parts: { BasePart }, fade: number, alpha: { number }?)
+	local base = alpha or DROPLET_ALPHA
+	for i, part in parts do
+		part.Transparency = base[i] + (1 - base[i]) * fade
+	end
+end
+
+-- Puts a droplet's ball (diameter `size`) at frame.Position with its tail streaming back from the
+-- LookVector; `stretch` 0 is a round drop, 1 a teardrop three times as long as it is wide. Pass
+-- `resize` only when the size or stretch changed (resizing costs more than moving).
+local function placeDroplet(parts: { BasePart }, frame: CFrame, size: number, stretch: number, resize: boolean)
+	size = math.max(size, 0.02)
+	local length = size * (1 + 2 * stretch)
+	if resize then
+		parts[1].Size = Vector3.one * size
+		parts[2].Size = Vector3.new(size * 0.82, size * 0.82, length)
+	end
+	parts[1].CFrame = frame
+	parts[2].CFrame = frame * CFrame.new(0, 0, length * 0.5 - size * 0.32)
+end
+
 type Ribbon = { A0: Attachment, A1: Attachment, Offset: number }
 
--- A ribbon of light: a Trail between two attachments that the caller moves every frame (their
--- separation is its width). FaceCamera off keeps a twisting band's real 3D twist.
+-- A stream of water light: a Trail between two attachments that the caller moves every frame
+-- (their separation is its width). FaceCamera off keeps a twisting band's real 3D twist.
 local function newRibbon(parent: Instance, colors: ColorSequence, lifetime: number, faceCamera: boolean, offset: number): Ribbon
 	local a0 = Instance.new("Attachment")
 	a0.Parent = parent
@@ -440,19 +438,27 @@ local function newRibbon(parent: Instance, colors: ColorSequence, lifetime: numb
 	return { A0 = a0, A1 = a1, Offset = offset }
 end
 
+-- Body and tail colours of the bolt's water.
+local function waterColors(color: Color3, edge: Color3): (Color3, Color3)
+	return WHITE:Lerp(color, 0.55), color:Lerp(edge, 0.45)
+end
+
 -------------------------------------------------------------------------------- growing (charge)
+
+type Inflow = { Parts: { BasePart }, Angle: number, Plane: CFrame, Phase: number, Appear: number }
 
 type Charge = {
 	Mouth: Attachment,
 	Start: number,
 	Duration: number,
 	Unit: number,
-	Holder: BasePart, -- invisible ball at the charge: the intake sparkles' sphere; owns everything else
-	Orb: BasePart,
+	Holder: BasePart, -- invisible ball at the charge: the mist's sphere; owns everything else
+	Orb: { BasePart },
+	Shell: { BasePart },
 	Light: PointLight,
 	Halo: ParticleEmitter,
 	Intake: ParticleEmitter,
-	Crystals: { Crystal },
+	Droplets: { Inflow },
 	Ribbons: { Ribbon },
 }
 
@@ -476,25 +482,35 @@ local function updateCharge(charge: Charge, now: number): boolean
 	local progress = elapsed / charge.Duration
 	local grow = easeOut(progress)
 	local frame = charge.Mouth.WorldCFrame * CFrame.new(0, 0, -CHARGE_AHEAD)
-	local spun = frame * CFrame.Angles(0, 0, elapsed * 1.6) -- the whole cluster turns slowly
+	local spun = frame * CFrame.Angles(0, 0, elapsed * 1.6) -- the whole thing turns slowly
 	local size = unit * (0.5 + 1.9 * grow)
 	charge.Holder.CFrame = frame
-	charge.Orb.Size = Vector3.one * size
-	charge.Orb.CFrame = frame
+	placeDroplet(charge.Orb, frame, size, 0, true)
+	placeDroplet(charge.Shell, frame, size * 1.35, 0, true)
+	fadeDroplet(charge.Orb, 0)
+	fadeDroplet(charge.Shell, 0, SHELL_ALPHA)
 	charge.Light.Brightness = 1 + 4 * grow
 	charge.Halo.Size = NumberSequence.new(size * 2.6)
 	charge.Intake.Rate = 15 + 55 * progress
 
-	-- Crystals sprout one after another and grow out of the orb.
-	for _, crystal in charge.Crystals do
-		local sprout = easeOut((progress - crystal.Appear) / 0.3)
-		if sprout <= 0 then
-			fadeCrystal(crystal.Parts, 1)
-		else
-			local direction = spun:VectorToWorldSpace(crystal.Direction)
-			fadeCrystal(crystal.Parts, 0)
-			placeCrystal(crystal.Parts, aim(frame.Position + direction * size * 0.3, direction), crystal.Length * sprout, crystal.Width * sprout, true)
+	-- Droplets spiral in from all round, faster as they near the orb, and are swallowed.
+	local outer = unit * (5 - 1.5 * grow)
+	local inner = size * 0.45
+	for _, droplet in charge.Droplets do
+		if progress < droplet.Appear then
+			fadeDroplet(droplet.Parts, 1)
+			continue
 		end
+		local function at(s: number): Vector3
+			local radius = outer + (inner - outer) * s * s
+			local angle = droplet.Angle + s * 2.6
+			return frame.Position + (spun * droplet.Plane):VectorToWorldSpace(Vector3.new(math.cos(angle), math.sin(angle), 0)) * radius
+		end
+		local s = (elapsed / CHARGE_CYCLE + droplet.Phase) % 1
+		local position = at(s)
+		local scale = smooth(s / 0.15) * (1 - smooth((s - 0.75) / 0.25)) -- grows in, shrinks as it is swallowed
+		placeDroplet(droplet.Parts, aim(position, at(math.min(s + 0.02, 1)) - position), unit * 0.55 * scale, 0.3 + 1.2 * s, true)
+		fadeDroplet(droplet.Parts, 0)
 	end
 
 	-- Two streams whirl round it on tilted circles that tighten as it grows.
@@ -518,7 +534,7 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 		return function() end
 	end
 	local color = StormfinConfig.Visuals.BoltColor
-	local light, dark = WHITE:Lerp(color, 0.35), BOLT_EDGE:Lerp(color, 0.3)
+	local body, tail = waterColors(color, BOLT_EDGE)
 	local unit = StormfinConfig.Bolt.Radius * BOLT_SCALE
 
 	local holder = invisiblePart(Enum.PartType.Ball, unit * 7)
@@ -537,45 +553,37 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 		LockedToPart = true,
 		Rate = 30,
 	})
-	local intake = VFXUtil.Emitter(holder, { -- sparkles drawn in from all round
+	local intake = VFXUtil.Emitter(holder, { -- fine mist drawn in from all round
 		Texture = Tex.Glow,
 		Color = VFXUtil.Hot(color, WHITE),
 		LightEmission = 1,
 		Shape = Enum.ParticleEmitterShape.Sphere,
 		ShapeInOut = Enum.ParticleEmitterShapeInOut.Inward,
 		ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface,
-		Size = Seq({ { 0, 0 }, { 0.3, unit * 0.35 }, { 1, unit * 0.1 } }),
-		Transparency = Seq({ { 0, 1 }, { 0.3, 0.1 }, { 1, 0 } }),
+		Size = Seq({ { 0, 0 }, { 0.3, unit * 0.3 }, { 1, unit * 0.1 } }),
+		Transparency = Seq({ { 0, 1 }, { 0.3, 0.2 }, { 1, 0 } }),
 		Lifetime = NumberRange.new(0.25, 0.35),
 		Speed = NumberRange.new(unit * 9),
 		Rate = 15,
 	})
 
-	local orb = invisiblePart(Enum.PartType.Ball, unit)
-	orb.Material = Enum.Material.Neon
-	orb.Color = WHITE:Lerp(color, 0.3)
-	orb.Parent = holder
+	local orb = newDroplet(body, body, holder)
+	local shell = newDroplet(color, color, holder)
 	local glow = Instance.new("PointLight")
 	glow.Color = color
 	glow.Range = 12
 	glow.Brightness = 1
 	glow.Shadows = false
-	glow.Parent = orb
+	glow.Parent = orb[1]
 
-	-- Crystals spread round the front half (never back into the fin's head), sprouting in turn.
-	local crystals: { Crystal } = {}
-	for i = 1, CHARGE_CRYSTALS do
-		local azimuth = i * 2.39996 -- golden angle: spreads them evenly round
-		local tilt = math.rad(40 + 50 * ((i * 0.618) % 1)) -- from straight ahead out to the sides
-		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), -math.cos(tilt))
-		local length = unit * (1.6 + 1.2 * ((i * 0.382) % 1))
-		table.insert(crystals, {
-			Parts = newCrystal(light, dark, holder),
-			Frame = CFrame.identity,
-			Direction = direction,
-			Length = length,
-			Width = length * 0.42,
-			Appear = 0.08 + 0.55 * (i - 1) / (CHARGE_CRYSTALS - 1),
+	local droplets: { Inflow } = {}
+	for i = 1, CHARGE_DROPLETS do
+		table.insert(droplets, {
+			Parts = newDroplet(body, tail, holder),
+			Angle = i * 2.39996, -- golden angle: spreads them evenly round
+			Plane = CFrame.Angles(math.rad(-50 + 100 * ((i * 0.618) % 1)), math.rad(-40 + 80 * ((i * 0.382) % 1)), 0),
+			Phase = i / CHARGE_DROPLETS,
+			Appear = 0.05 + 0.4 * (i - 1) / (CHARGE_DROPLETS - 1),
 		})
 	end
 	local ribbons = {
@@ -591,10 +599,11 @@ function EnemyVisuals.ChargeStormBolt(mouth: Attachment, duration: number): () -
 		Unit = unit,
 		Holder = holder,
 		Orb = orb,
+		Shell = shell,
 		Light = glow,
 		Halo = halo,
 		Intake = intake,
-		Crystals = crystals,
+		Droplets = droplets,
 		Ribbons = ribbons,
 	}
 	table.insert(charges, charge)
@@ -606,12 +615,15 @@ end
 
 -------------------------------------------------------------------------------- firing (projectile)
 
+type Orbiter = { Parts: { BasePart }, Offset: number, Size: number, Behind: number }
+
 type Decor = {
 	Unit: number,
-	Crystals: { Crystal },
+	Body: { BasePart },
+	Shell: { BasePart },
+	Orbiters: { Orbiter },
 	Helix: { Ribbon },
 	Tail: Ribbon,
-	Spin: number,
 	Phase: number,
 }
 
@@ -628,12 +640,12 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 	local tip = Instance.new("Attachment")
 	tip.Name = "Center"
 	tip.Parent = bolt
-	local hot = VFXUtil.Hot(WHITE, color)
+	local body, tail = waterColors(color, edge)
 
-	VFXUtil.Emitter(tip, { -- white-hot core
+	VFXUtil.Emitter(tip, { -- bright heart of the drop
 		Texture = Tex.Glow,
 		Color = ColorSequence.new(WHITE, WHITE:Lerp(color, 0.5)),
-		Size = NumberSequence.new(unit * 2.2),
+		Size = NumberSequence.new(unit * 1.8),
 		Transparency = Seq({ { 0, 0 }, { 1, 0.5 } }),
 		Lifetime = NumberRange.new(0.08),
 		Speed = NumberRange.new(0),
@@ -641,7 +653,7 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 		ZOffset = 1,
 		Rate = 40,
 	})
-	VFXUtil.Emitter(tip, { -- coloured halo round the crystals
+	VFXUtil.Emitter(tip, { -- coloured glow round it
 		Texture = Tex.Glow,
 		Color = ColorSequence.new(color, edge),
 		LightEmission = 0.6,
@@ -655,13 +667,13 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 
 	-- Comet glow: Beams from the head to a tail attachment that trails BOLT_LENGTH behind (moved
 	-- each frame, see Init), widening back. The texture scrolls toward the tail so it streams.
-	local tail = Instance.new("Attachment")
-	tail.Name = "Tail"
-	tail.Parent = bolt
+	local tailEnd = Instance.new("Attachment")
+	tailEnd.Name = "Tail"
+	tailEnd.Parent = bolt
 	local function beam(width0: number, width1: number, colors: ColorSequence, transparency: NumberSequence, speed: number)
 		local b = Instance.new("Beam")
 		b.Attachment0 = tip
-		b.Attachment1 = tail
+		b.Attachment1 = tailEnd
 		b.Texture = Tex.Beam
 		b.TextureMode = Enum.TextureMode.Stretch
 		b.TextureLength = 1
@@ -679,83 +691,77 @@ local function makeStormBolt(color: Color3, edge: Color3, radius: number): (Base
 	beam(unit * 2.4, unit * 8, ColorSequence.new(color, edge), Seq({ { 0, 0.35 }, { 0.5, 0.65 }, { 1, 1 } }), -1.5) -- glow
 	beam(unit, unit * 3, ColorSequence.new(WHITE, color), Seq({ { 0, 0.1 }, { 0.6, 0.5 }, { 1, 1 } }), -2.5) -- core
 
-	VFXUtil.Emitter(bolt, { -- sparkles shed into its wake
+	VFXUtil.Emitter(bolt, { -- spray shed into its wake, falling away
 		Texture = Tex.Glow,
-		Color = hot,
+		Color = VFXUtil.Hot(WHITE, color),
 		LightEmission = 1,
 		Shape = Enum.ParticleEmitterShape.Box,
 		ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume,
-		Size = Seq({ { 0, unit * 0.35 }, { 1, 0 } }),
+		Size = Seq({ { 0, unit * 0.35 }, { 1, unit * 0.1 } }),
 		Transparency = Seq({ { 0, 0 }, { 1, 1 } }),
-		Lifetime = NumberRange.new(0.3, 0.6),
+		Lifetime = NumberRange.new(0.35, 0.7),
 		Speed = NumberRange.new(1, 4),
 		SpreadAngle = Vector2.new(180, 180),
-		Drag = 2,
+		Acceleration = Vector3.new(0, -40, 0),
+		Drag = 1,
 		Rate = 45,
 	})
 
-	-- Crystal head: a spearhead forward, long spikes splayed back from the flight line and a ring
-	-- of short, chunky crystals round the core (the head frame looks along the flight: +Z is behind).
-	local light2, dark = WHITE:Lerp(color, 0.35), edge:Lerp(color, 0.3)
-	local crystals: { Crystal } = {}
-	local function addCrystal(base: Vector3, direction: Vector3, length: number, width: number)
-		table.insert(crystals, {
-			Parts = newCrystal(light2, dark, bolt),
-			Frame = aim(base, direction),
-			Direction = direction,
-			Length = length,
-			Width = width,
-			Appear = 0,
-		})
-	end
-	addCrystal(Vector3.new(0, 0, unit * 0.4), -Vector3.zAxis, unit * 2.6, unit * 1.1)
-	for i = 1, 5 do
-		local azimuth = i * 2 * math.pi / 5
-		local tilt = math.rad(26 + 14 * ((i * 0.618) % 1))
-		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), math.cos(tilt))
-		local length = unit * (3.2 + 1.4 * ((i * 0.382) % 1))
-		addCrystal(Vector3.new(0, 0, -unit * 0.2), direction, length, length * 0.4)
-	end
-	for i = 1, 4 do
-		local azimuth = (i + 0.5) * 2 * math.pi / 4
-		local tilt = math.rad(60 + 20 * ((i * 0.618) % 1))
-		local direction = Vector3.new(math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), math.cos(tilt))
-		addCrystal(Vector3.new(0, 0, unit * 0.1), direction, unit * 1.8, unit * 1.4)
-	end
-	for _, crystal in crystals do
-		fadeCrystal(crystal.Parts, 0)
-		placeCrystal(crystal.Parts, crystal.Frame, crystal.Length, crystal.Width, true) -- sized once; after this they only move
+	-- The head: one big teardrop of water inside a see-through bubble, droplets circling it.
+	local decor: Decor = {
+		Unit = unit,
+		Body = newDroplet(body, tail, bolt),
+		Shell = newDroplet(color, color, bolt),
+		Orbiters = {},
+		Helix = {},
+		Tail = newRibbon(bolt, ColorSequence.new(body, edge), 0.38, true, 0),
+		Phase = 0,
+	}
+	placeDroplet(decor.Body, CFrame.identity, unit * 2.2, 0.8, true)
+	placeDroplet(decor.Shell, CFrame.identity, unit * 3, 0.5, true)
+	fadeDroplet(decor.Body, 0)
+	fadeDroplet(decor.Shell, 0, SHELL_ALPHA)
+	for i = 1, BOLT_DROPLETS do
+		local orbiter: Orbiter = {
+			Parts = newDroplet(body, tail, bolt),
+			Offset = i * 2 * math.pi / BOLT_DROPLETS,
+			Size = unit * (0.45 + 0.3 * ((i * 0.618) % 1)),
+			Behind = unit * (0.2 + 1.2 * ((i * 0.382) % 1)),
+		}
+		placeDroplet(orbiter.Parts, CFrame.identity, orbiter.Size, 1.2, true)
+		fadeDroplet(orbiter.Parts, 0)
+		table.insert(decor.Orbiters, orbiter)
 	end
 
-	-- Ribbons: three bands twisting round the wake, and a thin wavy streamer down the middle.
+	-- Streams: three bands twisting round the wake, and a thin wavy streamer down the middle.
 	local helixColors = ColorSequence.new({
 		ColorSequenceKeypoint.new(0, WHITE),
 		ColorSequenceKeypoint.new(0.4, color),
 		ColorSequenceKeypoint.new(1, edge),
 	})
-	local helix = {}
 	for i = 1, 3 do
-		table.insert(helix, newRibbon(bolt, helixColors, 0.26, false, (i - 1) * 2 * math.pi / 3))
+		table.insert(decor.Helix, newRibbon(bolt, helixColors, 0.26, false, (i - 1) * 2 * math.pi / 3))
 	end
-	local decor: Decor = {
-		Unit = unit,
-		Crystals = crystals,
-		Helix = helix,
-		Tail = newRibbon(bolt, ColorSequence.new(light2, edge), 0.38, true, 0),
-		Spin = 0,
-		Phase = 0,
-	}
-	return bolt, tail, decor
+	return bolt, tailEnd, decor
 end
 
--- Moves the bolt's crystals and ribbons with it (after its CFrame is set for this frame).
+-- Moves the bolt's droplets and streams with it (after its CFrame is set for this frame).
 local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
-	decor.Spin += dt * 2.5 -- the crystal head rolls slowly
-	decor.Phase += dt * 30 -- the ribbons wind round fast
+	decor.Phase += dt * 30 -- the streams wind round fast
 	local unit = decor.Unit
-	local head = bolt.CFrame * CFrame.Angles(0, 0, decor.Spin)
-	for _, crystal in decor.Crystals do
-		placeCrystal(crystal.Parts, head * crystal.Frame, crystal.Length, crystal.Width, false)
+	local head = bolt.CFrame
+	-- The drop wobbles like liquid: the body and bubble breathe a little.
+	local wobble = 1 + 0.08 * math.sin(decor.Phase * 0.7)
+	placeDroplet(decor.Body, head, unit * 2.2 * wobble, 0.8, true)
+	placeDroplet(decor.Shell, head, unit * 3 / wobble, 0.5, true)
+	for _, orbiter in decor.Orbiters do
+		local angle = decor.Phase * 0.35 + orbiter.Offset
+		local radius = unit * (1.7 + 0.3 * math.sin(decor.Phase * 0.5 + orbiter.Offset * 3))
+		local out = Vector3.new(math.cos(angle), math.sin(angle), 0)
+		local tangent = Vector3.new(-math.sin(angle), math.cos(angle), 0)
+		-- Moving with the bolt and round it: pointed mostly forward, leaning into its orbit.
+		local frame = aim(out * radius + Vector3.new(0, 0, orbiter.Behind), -Vector3.zAxis + tangent * 0.35)
+		placeDroplet(orbiter.Parts, head * frame, orbiter.Size, 1.2, false)
 	end
 	local behind = Vector3.new(0, 0, unit * 1.2)
 	for _, ribbon in decor.Helix do
@@ -765,9 +771,9 @@ local function updateBoltDecor(bolt: BasePart, decor: Decor, dt: number)
 		ribbon.A0.Position = behind + out * radius
 		ribbon.A1.Position = behind + out * (radius + unit * 0.45)
 	end
-	local wobble = Vector3.new(math.sin(decor.Phase * 0.45) * unit * 0.9, 0, unit * 1.5)
-	decor.Tail.A0.Position = wobble
-	decor.Tail.A1.Position = wobble + Vector3.new(0, unit * 0.5, 0)
+	local sway = Vector3.new(math.sin(decor.Phase * 0.45) * unit * 0.9, 0, unit * 1.5)
+	decor.Tail.A0.Position = sway
+	decor.Tail.A1.Position = sway + Vector3.new(0, unit * 0.5, 0)
 end
 
 -- A small burst where a bolt leaves the mouth (or the parrying player).
@@ -793,32 +799,32 @@ end
 
 -------------------------------------------------------------------------------- exploding (impact)
 
-type Shard = {
+type Splash = {
 	Parts: { BasePart },
 	Origin: Vector3,
 	Velocity: Vector3,
-	Tumble: Vector3, -- axis it spins about as it flies
-	Length: number,
-	Width: number,
+	Size: number,
 	Start: number,
 	Life: number,
 }
 
-local shards: { Shard } = {}
+local splashes: { Splash } = {}
 
--- Moves an explosion shard for this frame; false once it has faded out (and is destroyed).
-local function updateShard(shard: Shard, now: number): boolean
-	local t = now - shard.Start
-	if t >= shard.Life then
-		destroyAll(shard.Parts)
+-- Moves a splash droplet for this frame (drag and gravity, stretched along its motion); false once
+-- it has faded out (and is destroyed).
+local function updateSplash(splash: Splash, now: number): boolean
+	local t = now - splash.Start
+	if t >= splash.Life then
+		destroyAll(splash.Parts)
 		return false
 	end
-	local position = shard.Origin + shard.Velocity * ((1 - math.exp(-SHARD_DRAG * t)) / SHARD_DRAG) - Vector3.yAxis * (14 * t * t)
-	local frame = aim(position, shard.Velocity) * CFrame.fromAxisAngle(shard.Tumble, t * 9)
-	local life = t / shard.Life
-	local scale = 1 - smooth((life - 0.35) / 0.65)
-	placeCrystal(shard.Parts, frame, shard.Length * scale, shard.Width * scale, true)
-	fadeCrystal(shard.Parts, smooth((life - 0.55) / 0.45))
+	local decay = math.exp(-SPLASH_DRAG * t)
+	local position = splash.Origin + splash.Velocity * ((1 - decay) / SPLASH_DRAG) - Vector3.yAxis * (0.5 * SPLASH_GRAVITY * t * t)
+	local velocity = splash.Velocity * decay - Vector3.yAxis * (SPLASH_GRAVITY * t)
+	local life = t / splash.Life
+	local scale = 1 - smooth((life - 0.45) / 0.55)
+	placeDroplet(splash.Parts, aim(position, velocity), splash.Size * scale, math.clamp(velocity.Magnitude / 25, 0.2, 2.2), true)
+	fadeDroplet(splash.Parts, smooth((life - 0.6) / 0.4))
 	return true
 end
 
@@ -838,7 +844,7 @@ local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel
 			LockedToPart = true,
 			ZOffset = 1,
 		}):Emit(1)
-		VFXUtil.Emitter(a, { -- white-hot centre
+		VFXUtil.Emitter(a, { -- bright centre
 			Texture = Tex.Glow,
 			Color = ColorSequence.new(WHITE),
 			Size = Fade(unit * 6, unit * 2),
@@ -848,61 +854,58 @@ local function stormBurst(position: Vector3, color: Color3, edge: Color3, travel
 			LockedToPart = true,
 			ZOffset = 2,
 		}):Emit(1)
-		VFXUtil.Ring(a, hot, 1, unit * 22, 0.28):Emit(1)
+		VFXUtil.Ring(a, hot, 1, unit * 22, 0.28):Emit(1) -- splash rings
 		VFXUtil.Ring(a, ColorSequence.new(edge), 1, unit * 32, 0.45):Emit(1)
-		VFXUtil.Emitter(a, { -- sparkles flung out, drifting down
+		VFXUtil.Emitter(a, { -- fine spray flung out and raining down
 			Texture = Tex.Glow,
 			Color = hot,
 			LightEmission = 1,
-			Size = Seq({ { 0, unit * 0.45 }, { 1, 0 } }),
-			Lifetime = NumberRange.new(0.4, 0.9),
-			Speed = NumberRange.new(8, 26),
+			Size = Seq({ { 0, unit * 0.4 }, { 1, unit * 0.1 } }),
+			Lifetime = NumberRange.new(0.5, 1),
+			Speed = NumberRange.new(8, 24),
 			SpreadAngle = Vector2.new(180, 180),
-			Drag = 3,
-			Acceleration = Vector3.new(0, -8, 0),
-		}):Emit(36)
-		VFXUtil.Emitter(a, { -- a puff of icy mist
+			Drag = 2,
+			Acceleration = Vector3.new(0, -45, 0),
+		}):Emit(40)
+		VFXUtil.Emitter(a, { -- a puff of mist
 			Texture = Tex.Smoke,
 			Color = ColorSequence.new(color),
 			LightEmission = 0.3,
 			Size = Fade(unit * 3, unit * 7),
-			Transparency = Fade(0.6, 1),
-			Lifetime = NumberRange.new(0.4, 0.6),
+			Transparency = Fade(0.55, 1),
+			Lifetime = NumberRange.new(0.45, 0.7),
 			Speed = NumberRange.new(2, 5),
 			SpreadAngle = Vector2.new(180, 180),
 			Rotation = NumberRange.new(0, 360),
-		}):Emit(5)
+		}):Emit(6)
 		VFXUtil.Flash(a, color, 18, 6, 0.3)
 	end
 
-	-- Crystal shards and needle rays flung outward, mostly back the way it came.
+	-- Droplets burst out, mostly back the way it came: big drops, then thin fast streaks of spray.
 	local folder = fxFolder()
 	if not folder then
 		return
 	end
-	local light, dark = WHITE:Lerp(color, 0.35), edge:Lerp(color, 0.3)
+	local body, tail = waterColors(color, edge)
 	local back = if travel.Magnitude > 1e-3 then -travel.Unit else Vector3.zero
 	local now = os.clock()
-	local function fling(count: number, speed: NumberRange, length: NumberRange, thinness: number, life: NumberRange)
+	local function burst(count: number, speed: NumberRange, size: NumberRange, life: NumberRange)
 		for _ = 1, count do
-			local direction = (randomUnit() + back * 0.6).Unit
-			local size = length.Min + (length.Max - length.Min) * math.random()
-			local shard: Shard = {
-				Parts = newCrystal(light, dark, folder),
+			local direction = (randomUnit() + back * 0.6 + Vector3.yAxis * 0.4).Unit
+			local splash: Splash = {
+				Parts = newDroplet(body, tail, folder),
 				Origin = position,
 				Velocity = direction * (speed.Min + (speed.Max - speed.Min) * math.random()),
-				Tumble = randomUnit(),
-				Length = size,
-				Width = size * thinness,
+				Size = size.Min + (size.Max - size.Min) * math.random(),
 				Start = now,
 				Life = life.Min + (life.Max - life.Min) * math.random(),
 			}
-			table.insert(shards, shard)
-			updateShard(shard, now)
+			table.insert(splashes, splash)
+			updateSplash(splash, now)
 		end
 	end
-	fling(8, NumberRange.new(24, 42), NumberRange.new(unit * 2, unit * 3.6), 0.45, NumberRange.new(0.45, 0.7)) -- shards
-	fling(8, NumberRange.new(45, 65), NumberRange.new(unit * 4, unit * 7), 0.08, NumberRange.new(0.2, 0.3)) -- rays
+	burst(12, NumberRange.new(16, 34), NumberRange.new(unit * 0.6, unit * 1.1), NumberRange.new(0.55, 0.85)) -- drops
+	burst(8, NumberRange.new(38, 55), NumberRange.new(unit * 0.25, unit * 0.4), NumberRange.new(0.25, 0.4)) -- spray streaks
 end
 
 local function clearCharge(model: Model)
@@ -1065,9 +1068,11 @@ local function endProjectile(id: number, position: Vector3?, reason: string?)
 	local color = projectile.Color
 	local decor = projectile.Decor
 	if decor then
-		-- The crystal head shatters (the burst below flings the shards) or blinks out at range.
-		for _, crystal in decor.Crystals do
-			destroyAll(crystal.Parts)
+		-- The drop bursts (the splash below flings its droplets) or vanishes at the end of its range.
+		destroyAll(decor.Body)
+		destroyAll(decor.Shell)
+		for _, orbiter in decor.Orbiters do
+			destroyAll(orbiter.Parts)
 		end
 	end
 	-- Let the trail and wake finish instead of vanishing with the orb.
@@ -1123,7 +1128,7 @@ local function onEnemyProjectile(kind: string, id: number, a: any, b: any, c: an
 	if kind == "Fire" then
 		local origin, direction, speed, range, style = a, b, c, d, e
 		-- Blasts are cyan (parryable); a reflected projectile takes the player's attack colour; the
-		-- Stormfin's Storm Bolt is blue-white storm-ice.
+		-- Stormfin's Storm Bolt is blue-white storm-water.
 		local color = PARRYABLE_COLOR
 		local radius = DummyConfig.Blast.Radius
 		local edge = BOLT_EDGE
@@ -1208,16 +1213,16 @@ function EnemyVisuals.Init()
 				end
 			end
 		end
-		-- Storm Bolt charges and explosion shards (backwards: finished ones are removed).
+		-- Storm Bolt charges and splash droplets (backwards: finished ones are removed).
 		for i = #charges, 1, -1 do
 			local charge = charges[i]
 			if not updateCharge(charge, now) then
 				endCharge(charge)
 			end
 		end
-		for i = #shards, 1, -1 do
-			if not updateShard(shards[i], now) then
-				table.remove(shards, i)
+		for i = #splashes, 1, -1 do
+			if not updateSplash(splashes[i], now) then
+				table.remove(splashes, i)
 			end
 		end
 	end)

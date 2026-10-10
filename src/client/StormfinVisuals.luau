@@ -473,7 +473,7 @@ local function onSegment(view: View, segment: Motion.Segment)
 					return
 				end
 				EnemyVisuals.Telegraph(view.Model, extra.Parryable == true, chargeTime, view.Mouth)
-				-- The bolt grows at the mouth: orb, crystals sprouting, streams whirling round it.
+				-- The bolt grows at the mouth: a water orb swallowing droplets, streams whirling round it.
 				stopCharge(view)
 				view.StopCharge = EnemyVisuals.ChargeStormBolt(view.Mouth, chargeTime)
 				view.ChargeGlow.Rate = 40
