@@ -96,7 +96,6 @@ local IDLE_STEP_ERROR = 0.4 -- studs: standing, a foot this far from where it sh
 local IDLE_STEP_TIME = 0.26
 local MAX_PLANT_ERROR = 6 -- studs: a planted foot this far off (a teleport) snaps instead of stepping
 local RETARGET_UNTIL = 0.7 -- of a swing: the landing spot follows the body until then, then holds
-local SWING_LIFT = 1 / (0.385 ^ 2 * 0.615 ^ 3.2) -- scales s²(1 - s)^3.2 (peak at 38.5%) to 1
 
 local FOLLOW_RATE = 16 -- 1/s: critically damped spring onto the server hitbox position...
 -- ...fed part of its velocity, estimated from the replicated steps (Rate: low-pass of the position,
@@ -1212,14 +1211,17 @@ local function updateView(view: View, dt: number, t: number)
 			-- (as the body will be then), leaving and arriving at the ground's speed in that frame:
 			-- so the paw lifts off and sets down at rest, trailing back after lift-off and reaching
 			-- out past the landing spot before settling onto it, and it follows the body round a
-			-- turn instead of cutting under it. Up: lifts briskly, peaks early (38% of the swing) and
-			-- sets down softly.
+			-- turn instead of cutting under it.
 			local touchdown = predictGround(ground, groundVelocity, view.YawRate, (1 - s) * foot.SwingTime)
 			local landing = touchdown:PointToObjectSpace(foot.Landing)
 			local landingRate = stillRate(landing, ground:VectorToObjectSpace(groundVelocity), view.YawRate)
 			local path = hermite(foot.FromLocal, foot.FromRate * foot.SwingTime, landing, landingRate * foot.SwingTime, s)
 			local lift = if view.Moving then (if front then liftF else liftH) * stepping + 0.08 else 0.2
-			local height = lift * SWING_LIFT * s * s * (1 - s) ^ 3.2
+			-- Walking it peaks early and sets down softly; at a run the paw stays up longer and
+			-- stabs down (it would otherwise skim the floor while still swinging forward fast).
+			local descent = 3.2 - 2.2 * clamp01((speed - 5) / 12)
+			local peak = 2 / (2 + descent)
+			local height = lift * (s / peak) ^ 2 * ((1 - s) / (1 - peak)) ^ descent
 			position = ground * path + UP * height
 			-- The paw peels off the floor and lands flat a little before touchdown, easing both ways.
 			foot.Lifted = smooth(math.min(s, 0.9 - s) / 0.3)
