@@ -45,7 +45,7 @@ local THRASH_BEAT = 14 -- floundering on the surface
 local BANK_ACCEL = 60 -- studs/s² of sideways (turning) acceleration that banks it 45 degrees
 local MAX_BANK = 0.6 -- radians
 local CORRECTION_TIME = 0.15 -- seconds to ease out the jump when a segment arrives late
-local MAX_CORRECTION = 8 -- studs (plus a quarter of the new segment's starting speed); bigger jumps (a resync) snap
+local MAX_CORRECTION = 8 -- studs (plus 0.35 s of the change in velocity); bigger jumps (a resync) snap
 local FLINCH_TIME = 0.22 -- hit reaction length
 local SHAKE_RANGE = 30 -- studs: a breach this close to you shakes the camera
 -- Spine segment sizes, head first: a sleek taper from a broad chest to a thin tail stalk. Each is
@@ -85,6 +85,7 @@ type View = {
 	Forward: Vector3?, -- facing drawn last frame
 	Drawn: Vector3?, -- body centre drawn last frame...
 	DrawnTime: number, -- ...and the server time it was drawn for
+	Late: number, -- how late (s) the current segment arrived: the body turns faster while it catches up
 	Correction: Vector3, -- offset eased out after a late segment
 	CorrectionStart: number,
 	Accel: Vector3, -- smoothed acceleration (studs/s²)
@@ -259,6 +260,7 @@ local function newView(id: number, serverModel: Model?, model: Model, effects: E
 		Forward = nil,
 		Drawn = nil,
 		DrawnTime = 0,
+		Late = 0,
 		Correction = Vector3.zero,
 		CorrectionStart = 0,
 		Accel = Vector3.zero,
@@ -431,9 +433,12 @@ local function onSegment(view: View, segment: Motion.Segment)
 	-- the fish (still on the old segment) and where the new one puts it at that same moment.
 	if view.Drawn then
 		local gap = view.Drawn - Motion.Evaluate(segment, view.DrawnTime)
-		local limit = MAX_CORRECTION + (segment.V or Vector3.zero).Magnitude * 0.25
+		-- The gap grows with how sharply the velocity changed (a parry reverses it), so allow for that.
+		local oldVelocity = if view.Previous then Motion.Velocity(view.Previous, view.DrawnTime) else Vector3.zero
+		local limit = MAX_CORRECTION + (Motion.Velocity(segment, view.DrawnTime) - oldVelocity).Magnitude * 0.35
 		view.Correction = if gap.Magnitude < limit then gap else Vector3.zero
 		view.CorrectionStart = os.clock()
+		view.Late = math.max(view.DrawnTime - segment.Start, 0)
 	end
 	local kind = segment.Kind
 	local extra = segment.Extra or {}
@@ -569,6 +574,9 @@ local function update(dt: number)
 		if view.Forward then
 			local angle = math.acos(math.clamp(view.Forward:Dot(forward), -1, 1))
 			local step = MAX_TURN_RATE * dt
+			if fade < 1 then
+				step *= 1 + view.Late / CORRECTION_TIME -- catch up on the turn as it catches up on position
+			end
 			if angle > step then
 				forward = Motion.TurnToward(view.Forward, forward, step / angle)
 			end
@@ -622,13 +630,14 @@ local function update(dt: number)
 		end
 
 		-- Undulation: a wave travelling back along the body, strongest at the tail.
-		-- Powered (swimming, rising, hovering): the beat is locked to its speed along its path, and it
+		-- Powered (swimming, rising, hovering): the beat is locked to its head-first speed, and it
 		-- strokes harder while accelerating. Floundering: a fast thrash. Otherwise (airborne, or gliding after
 		-- a splash) there's no thrust: a slow, small trailing sway.
 		local side = forward:Cross(UP)
 		side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
 		local travel = if speed > 1e-3 then velocity / speed else forward
 		local thrust = math.clamp(view.Accel:Dot(travel) / 40, 0, 1) -- speeding up along its path
+		local bodySpeed = math.max(velocity:Dot(forward), 0) -- swimming head-first (not sliding sideways or back)
 		local beat, amplitude
 		if view.Dead then
 			beat, amplitude = 0, 0
@@ -638,8 +647,8 @@ local function update(dt: number)
 			-- Braking and coiling: no stroke, the tension shows in the tremble below.
 			beat, amplitude = IDLE_BEAT, 0.16
 		elseif powered then
-			beat = math.max(IDLE_BEAT, speed * BEAT_PER_STUD) * (1 + 0.4 * thrust)
-			amplitude = 0.16 + 0.3 * math.clamp(speed / Config.Swim.Speed, 0, 1.3) + 0.2 * thrust
+			beat = math.max(IDLE_BEAT, bodySpeed * BEAT_PER_STUD) * (1 + 0.4 * thrust)
+			amplitude = 0.16 + 0.3 * math.clamp(bodySpeed / Config.Swim.Speed, 0, 1.3) + 0.2 * thrust
 		else
 			beat, amplitude = COAST_BEAT, 0.12
 		end
