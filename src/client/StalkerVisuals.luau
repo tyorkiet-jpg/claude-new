@@ -525,6 +525,8 @@ type Spine = {
 	NeckShift: number,
 	TailYaw: number, -- swings out of a turn
 	TailPitch: number, -- up as a counterweight (gallop, braking)
+	TailSway: number, -- the base's side-to-side beat with the stride (radians)
+	TailFlick: number, -- the tip's idle twitch (radians)
 }
 
 -- Poses the rig. `frame` is the body centre (Config.BodyHeight above the model origin), `ground`
@@ -618,38 +620,54 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 		end
 	end
 
-	-- Tail: a chain of springs from the hips. Each segment is pulled toward its rest direction
-	-- (carried by the hips, raised a little at speed, swaying with the gait) and keeps its momentum,
-	-- so it swings, lags and follows through; a bend limit keeps it from trailing absurdly far.
+	-- Tail: a chain of damped springs rooted in the pelvis. Real quadruped tails are driven from
+	-- the base (the tail muscles fire alternately with the stride, so it beats side to side in time
+	-- with the hips) and the rest follows passively: each segment is pulled toward its rest bend
+	-- *relative to the segment before it*, so a motion at the base travels down the tail as a wave,
+	-- lagging and growing toward the tip. It also works as a counterweight / rudder: it rises when
+	-- braking (offsetting the pitch forward), swings out and lifts through a turn (the cheetah's
+	-- roll-countering sweep), and counter-pitches the gallop's rocking.
 	local points, velocities = view.Tail, view.TailVelocity
 	local hipsFrame = posed.Hips or modelCF
 	local base = if relative.Tail1 then (hipsFrame * relative.Tail1).Position else frame.Position
+	-- Model-space directions carried by the posed pelvis (its pitch, roll and bend reach the tail).
+	local hipsMap = if posed.Hips then posed.Hips.Rotation * rest.Hips.Rotation:Inverse() else modelCF.Rotation
 	local tailBasis = modelCF * CFrame.Angles(0, -0.35 * spine.Bend + spine.TailYaw, 0)
 	local limp = pose.Collapse
+	local drive = CFrame.Angles(0, spine.TailYaw + spine.TailSway, 0) * CFrame.Angles(spine.TailPitch, 0, 0)
+	local function restDirection(i: number): Vector3
+		return hipsMap:VectorToWorldSpace((drive * CFrame.Angles(0, if i >= TAIL_SEGMENTS - 1 then spine.TailFlick else 0, 0)):VectorToWorldSpace(body.Direction["Tail" .. i]))
+	end
 	if #points == 0 then
 		points[1] = base
 		velocities[1] = Vector3.zero
 		for i = 1, TAIL_SEGMENTS do
-			points[i + 1] = points[i] + tailBasis:VectorToWorldSpace(body.Direction["Tail" .. i]) * body.TailLengths[i]
+			points[i + 1] = points[i] + restDirection(i) * body.TailLengths[i]
 			velocities[i + 1] = Vector3.zero
 		end
 	end
 	points[1] = base
 	local floorY = ground.Position.Y + 0.2
-	local raise = CFrame.Angles(spine.TailPitch, 0, 0)
-	local swayAngle = math.sin(view.Cycle * 2 * math.pi) * 0.12 * (1 - view.GaitWeights[3]) * clamp01(flat(view.Velocity).Magnitude / 6)
-	local stiffness = 180 * (1 - limp) + 4
-	local gravity = 6 + 60 * limp
+	local stiffness = 220 * (1 - limp) + 4
+	local gravity = 9 + 60 * limp
 	local h = math.min(dt, 1 / 30)
+	local previousRest = restDirection(1)
 	for i = 2, #points do
 		local length = body.TailLengths[i - 1]
-		local restLocal = raise * CFrame.Angles(0, swayAngle * (i - 1) * 0.5, 0) * body.Direction["Tail" .. (i - 1)]
-		local restDir = tailBasis:VectorToWorldSpace(restLocal)
+		local restDir = restDirection(i - 1)
+		if i > 2 then
+			-- Bend relative to the segment before (mostly), not to the hips: the wave passes along.
+			local parentActual = unitOr(points[i - 1] - points[i - 2], previousRest)
+			local carried = rotationBetween(previousRest, parentActual):VectorToWorldSpace(restDir)
+			previousRest = restDir
+			restDir = unitOr(restDir:Lerp(carried, 0.7), restDir)
+		end
 		local target = points[i - 1] + restDir * length
-		local k = stiffness * (1 - 0.13 * (i - 2))
+		-- Stiffer at the muscular base, looser toward the tip.
+		local k = stiffness * (1 - 0.16 * (i - 2))
 		local old = points[i]
 		local v = velocities[i] + ((target - old) * k - UP * gravity) * h
-		v *= math.exp(-7 * h)
+		v *= math.exp(-(7 + 1.5 * (i - 2)) * h)
 		local p = old + v * h
 		-- Keep the segment's length, and within its bend limit.
 		local dir = unitOr(p - points[i - 1], restDir)
@@ -1322,8 +1340,16 @@ local function updateView(view: View, dt: number, t: number)
 		HeadPitch = 0.4 * (pose.HeadPitch + view.LookPitch) + 0.3 * pose.NeckPush + 0.3 * steady,
 		HeadYaw = view.LookYaw + pose.HeadTurn,
 		NeckShift = 0.06 * pose.NeckPush,
+		-- Out of the turn, and lifted through it (the cheetah's conical sweep).
 		TailYaw = math.clamp(-0.17 * view.YawRate, -0.8, 0.8) * alive,
-		TailPitch = (0.12 * gallop * stepping + math.clamp(-forward / 80, 0, 1) * 0.4 - 0.6 * gaitPitch) * alive,
+		-- Up when braking (counters the pitch forward), a little down when accelerating, carried
+		-- higher at the gallop and counter-pitching its rocking.
+		TailPitch = (0.12 * gallop * stepping + math.clamp(-forward / 80, -0.3, 1) * 0.4 - 0.6 * gaitPitch
+			+ 0.25 * math.min(math.abs(view.YawRate) * speed / 60, 1)) * alive,
+		-- Beats with the hips at stride rate (walk widest, trot less, gallop barely: it pitches instead).
+		TailSway = math.sin(2 * math.pi * phase) * (0.2 * walkish + 0.1 * weights[2]) * stepping * alive,
+		-- Standing, the tip twitches now and then (a stalking cat's tell).
+		TailFlick = math.sin(clock * 2.3) * math.sin(clock * 0.37) * 0.35 * (1 - stepping) * alive,
 	}
 
 	applyBody(view, frame, ground, pose, spine, dt)
