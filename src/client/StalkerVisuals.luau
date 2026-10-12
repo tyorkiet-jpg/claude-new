@@ -190,6 +190,9 @@ type Foot = {
 	Lifted: number, -- 0 flat on the floor .. 1 fully off it
 	Girdle: Vector3, -- shoulder blade / pelvis offset this frame (body frame)
 	Held: Vector3, -- where an attack pose last put it (world), eased back from when it lets go
+	MetaPitch: number, -- hind legs: the hock-to-paw bone's swing off its rest angle (+ heel up / toes ahead)
+	MetaFrom: number, -- ...at lift-off
+	PlantedAt: number, -- os.clock() it last touched down
 }
 
 type View = {
@@ -505,7 +508,11 @@ local function solveLimb(root: Vector3, target: Vector3, bend: Vector3, upper: n
 	if distance > full - soft then
 		distance = full - soft * math.exp((full - soft - distance) / soft)
 	end
-	distance = math.max(distance, math.abs(upper - lower) + 0.05)
+	-- ...and the same at the other end, folding fully (no snap there either).
+	local folded = math.abs(upper - lower) + 0.05
+	if distance < folded + soft then
+		distance = folded + soft * math.exp((distance - folded - soft) / soft)
+	end
 	local dir = unitOr(offset, -UP)
 	target = root + dir * distance
 	local along = (upper * upper - lower * lower + distance * distance) / (2 * distance)
@@ -610,7 +617,7 @@ local function applyBody(view: View, frame: CFrame, ground: CFrame, pose: Pose, 
 			local lifted = view.Feet[leg].Lifted
 			local basis = if pose.Flight >= 0 or pose.Collapse > 0.5 then modelCF else ground:Lerp(modelCF, lifted * 0.6)
 			local hip = (posed.Hips * relative[thigh]).Position + modelCF:VectorToWorldSpace(view.Feet[leg].Girdle)
-			local metaWorld = basis:VectorToWorldSpace(body.Meta[leg])
+			local metaWorld = basis:VectorToWorldSpace(CFrame.Angles(view.Feet[leg].MetaPitch, 0, 0):VectorToWorldSpace(body.Meta[leg]))
 			local bend = modelCF:VectorToWorldSpace(Vector3.new(side * 0.12, 0, -1))
 			local knee, hock = solveLimb(hip, view.Feet[leg].Position - metaWorld, bend, body.Length[thigh], body.Length[shin])
 			aim(thigh, hip, knee, modelCF)
@@ -963,6 +970,7 @@ local function startSwing(foot: Foot, duration: number, clock: number, ground: C
 	foot.FromRate = stillRate(foot.FromLocal, ground:VectorToObjectSpace(velocity), yawRate)
 	foot.SwingStart = clock
 	foot.SwingTime = duration
+	foot.MetaFrom = foot.MetaPitch
 end
 
 -- The ground frame `tau` seconds from now, carried along the arc the body is moving on.
@@ -1256,6 +1264,7 @@ local function updateView(view: View, dt: number, t: number)
 			foot.Lifted = smooth(math.min(s, 0.9 - s) / 0.3)
 			if s >= 1 then
 				foot.Swinging = false
+				foot.PlantedAt = clock
 				foot.Plant = foot.Landing
 				position = foot.Landing
 				foot.Lifted = 0
@@ -1307,6 +1316,25 @@ local function updateView(view: View, dt: number, t: number)
 		local lowest = floor.Y + body.Stance[leg].Y + (0.15 - body.Stance[leg].Y) * pose.Collapse
 		position = Vector3.new(position.X, math.max(position.Y, lowest), position.Z)
 		foot.Position = position
+		-- Hind legs work like a pantograph (the knee and hock flex and extend together, linked by
+		-- the two-joint muscles): the heel rises through the second half of the stance as the leg
+		-- pushes off, the paw tucks up under the hock early in the swing, then the hock opens and
+		-- the paw reaches forward to land. Bigger with speed.
+		if not front then
+			local reachOut = (0.5 + 0.5 * clamp01(speed / 12)) * stepping * alive * (1 - held)
+			local hock
+			if foot.Swinging then
+				local s = clamp01((clock - foot.SwingStart) / foot.SwingTime)
+				hock = if s < 0.4
+					then foot.MetaFrom + (-0.45 * reachOut - foot.MetaFrom) * smooth(s / 0.4)
+					else -0.45 * reachOut + 0.5 * reachOut * smooth((s - 0.4) / 0.6)
+			else
+				-- Through the stance by time since touchdown (the gait clock can run ahead of a foot).
+				local r = if view.Moving then clamp01((clock - foot.PlantedAt) / math.max(stanceTime, 0.05)) else 0
+				hock = reachOut * (0.05 + 0.5 * smooth((r - 0.45) / 0.55))
+			end
+			foot.MetaPitch += (hock - foot.MetaPitch) * math.min(dt * 14, 1)
+		end
 	end
 
 	-- 5. Head: steady while the body bobs, leading into turns, tracking the nearest player with a
@@ -1439,6 +1467,9 @@ local function track(server: Model)
 			Lifted = 0,
 			Girdle = Vector3.zero,
 			Held = plant,
+			MetaPitch = 0,
+			MetaFrom = 0,
+			PlantedAt = 0,
 		}
 	end
 	local view: View = {
